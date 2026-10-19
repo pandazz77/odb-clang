@@ -22,10 +22,12 @@ required.
 To parse your headers the compiler still needs a C++ standard library (the
 headers only). By default it uses whatever the Clang driver detects for the
 default target (for example, MinGW-w64 or the system GCC/libstdc++ or
-libc++ headers on Linux). On Windows, if no standard library headers are
-found for the default target, the latest installed Visual Studio (MSVC)
-toolset is used automatically. Compiler options can be passed with `-x`, for
-example:
+libc++ headers on Linux). If no standard library headers are found for the
+default target, then on Windows the latest installed Visual Studio (MSVC)
+toolset is used automatically and on Linux the latest libstdc++ in
+`/usr/include/c++/<version>` (which may be installed without GCC, for
+example, `libstdc++-devel` on Fedora or `libstdc++-dev` on Alpine).
+Compiler options can be passed with `-x`, for example:
 
 ```
 odb -d sqlite -x --target=x86_64-pc-windows-msvc ...
@@ -41,6 +43,10 @@ Building (requires static Clang/LLVM libraries, CMake, and Ninja):
 cmake -G Ninja -S odb/odb -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+On Linux the result is a fully static executable that runs on any x86-64
+distribution (tested on Ubuntu 24.04, Debian 12, Fedora 41, and Alpine
+3.20). See `etc/Dockerfile.linux` for a build environment.
 
 Internally, the driver re-executes itself in the frontend mode (the hidden
 `-cc1odb` option) for each input file and database, the same way it used

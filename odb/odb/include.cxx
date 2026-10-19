@@ -332,6 +332,13 @@ namespace
           continue;
         }
 
+        // Treat CRLF as a newline (the file may have Windows line endings
+        // even on POSIX systems). In particular, this makes the backslash
+        // line continuation work the same way as in the compiler.
+        //
+        if (c == '\r' && is.peek () == '\n')
+          continue;
+
         if (bslash)
         {
           line += '\\';

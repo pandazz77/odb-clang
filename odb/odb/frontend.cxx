@@ -435,6 +435,78 @@ namespace
     return fs;
   }
 
+  // Make sure the builtin headers directory (<resource>/include) that we
+  // serve from memory is in the header search paths. Some distributions
+  // (e.g., Debian/Ubuntu) patch the Clang driver to use a hardcoded
+  // location (/usr/include/clang/<version>/include) instead of the
+  // resource directory. In this case replace that entry with ours or, if
+  // there is no such entry, add ours before the C system directories.
+  //
+  void
+  fix_builtin_include (clang::CompilerInvocation& inv,
+                       string const& resource_dir)
+  {
+    clang::HeaderSearchOptions& hso (inv.getHeaderSearchOpts ());
+
+    if (hso.UseBuiltinIncludes == false)
+      return;
+
+    llvm::SmallString<256> ri (resource_dir);
+    llvm::sys::path::append (ri, "include");
+
+    typedef vector<clang::HeaderSearchOptions::Entry> entries;
+    entries& es (hso.UserEntries);
+
+    auto normalize = [] (string const& s)
+    {
+      llvm::SmallString<256> p (s);
+      llvm::sys::path::remove_dots (p, true);
+      llvm::sys::path::native (p);
+
+      while (p.size () > 1 && llvm::sys::path::is_separator (p.back ()))
+        p.pop_back ();
+
+      return p.str ().str ();
+    };
+
+    string nri (normalize (ri.str ().str ()));
+
+    for (clang::HeaderSearchOptions::Entry const& e: es)
+      if (normalize (e.Path) == nri)
+        return;
+
+    // Look for .../clang/<version>/include.
+    //
+    for (clang::HeaderSearchOptions::Entry& e: es)
+    {
+      if (e.Group != clang::frontend::System || e.IsFramework)
+        continue;
+
+      string p (normalize (e.Path));
+      llvm::StringRef d (llvm::sys::path::parent_path (p));
+
+      if (llvm::sys::path::filename (p) == "include" &&
+          llvm::sys::path::filename (llvm::sys::path::parent_path (d)) ==
+          "clang")
+      {
+        e.Path = ri.str ().str ();
+        return;
+      }
+    }
+
+    entries::iterator i (es.begin ());
+    for (; i != es.end (); ++i)
+    {
+      if (i->Group == clang::frontend::ExternCSystem ||
+          i->Group == clang::frontend::CSystem ||
+          i->Group == clang::frontend::After)
+        break;
+    }
+
+    es.insert (i, clang::HeaderSearchOptions::Entry (
+                 ri.str (), clang::frontend::System, false, true));
+  }
+
   // Build the compiler invocation for the input file using the Clang
   // driver. Return NULL on failure (diagnostics has been issued).
   //
@@ -501,6 +573,7 @@ namespace
           *inv, cmd->getArguments (), diags, name))
       return nullptr;
 
+    fix_builtin_include (*inv, resource_dir);
     return inv;
   }
 
@@ -581,6 +654,75 @@ namespace
           }
         }
       }
+    }
+
+    return r;
+  }
+#endif
+
+#ifndef _WIN32
+  // Find the latest libstdc++ headers in /usr/include/c++/<version>.
+  // Return the include directories (the main, target-specific, and
+  // backward) or empty list if not found.
+  //
+  strings
+  find_libstdcxx ()
+  {
+    strings r;
+    llvm::VersionTuple rv;
+
+    llvm::SmallString<256> b ("/usr/include/c++");
+
+    error_code ec;
+    for (llvm::sys::fs::directory_iterator vi (b, ec), ve;
+         !ec && vi != ve; vi.increment (ec))
+    {
+      llvm::VersionTuple v;
+      if (v.tryParse (llvm::sys::path::filename (vi->path ())))
+        continue;
+
+      llvm::SmallString<256> h (vi->path ());
+      llvm::sys::path::append (h, "cstddef");
+
+      if (!llvm::sys::fs::exists (h) || (!r.empty () && v <= rv))
+        continue;
+
+      r.clear ();
+      r.push_back (vi->path ());
+      rv = v;
+
+      // Target-specific directory (contains bits/c++config.h). If there
+      // are several (multilib), prefer the one for our architecture.
+      //
+      string td;
+      bool tm (false);
+      string arch (
+        llvm::Triple (llvm::sys::getDefaultTargetTriple ()).getArchName ());
+
+      error_code ec1;
+      for (llvm::sys::fs::directory_iterator ti (vi->path (), ec1), te;
+           !ec1 && ti != te && !tm; ti.increment (ec1))
+      {
+        llvm::SmallString<256> c (ti->path ());
+        llvm::sys::path::append (c, "bits", "c++config.h");
+
+        if (!llvm::sys::fs::exists (c))
+          continue;
+
+        tm = llvm::sys::path::filename (ti->path ()).starts_with (arch + "-");
+
+        if (td.empty () || tm)
+          td = ti->path ();
+      }
+
+      if (!td.empty ())
+        r.push_back (td);
+
+      llvm::SmallString<256> bw (vi->path ());
+      llvm::sys::path::append (bw, "backward");
+
+      if (llvm::sys::fs::is_directory (bw))
+        r.push_back (bw.str ().str ());
     }
 
     return r;
@@ -671,7 +813,58 @@ namespace
 
     return build_invocation (exe, resource_dir, args, input, diags, fs, name);
 #else
-    return build_invocation (exe, resource_dir, cargs, input, diags, fs, name);
+    std::shared_ptr<clang::CompilerInvocation> inv (
+      build_invocation (exe, resource_dir, cargs, input, diags, fs, name));
+
+    if (inv == nullptr                 ||
+        has_arg (cargs, "--target=")   ||
+        has_arg (cargs, "-target")     ||
+        has_arg (cargs, "--sysroot")   ||
+        has_arg (cargs, "-isysroot")   ||
+        has_arg (cargs, "-nostdinc")   ||
+        has_arg (cargs, "-stdlib=")    ||
+        has_arg (cargs, "--gcc-")      ||
+        has_std_headers (*inv))
+      return inv;
+
+    // The Clang driver only finds libstdc++ as part of a GCC installation
+    // (which it detects by the presence of crtbegin.o, etc). The headers,
+    // however, may be installed without GCC (e.g., libstdc++-devel on
+    // Fedora or libstdc++-dev on Alpine). So as a fallback look for them
+    // in the standard location.
+    //
+    strings ds (find_libstdcxx ());
+
+    if (ds.empty ())
+      return inv;
+
+    if (options_ != nullptr && options_->trace ())
+      cerr << "no C++ standard library headers found for the default "
+           << "target, using " << ds.front () << endl;
+
+    // Add before the builtin and C system directories.
+    //
+    typedef vector<clang::HeaderSearchOptions::Entry> entries;
+    entries& es (inv->getHeaderSearchOpts ().UserEntries);
+
+    entries::iterator i (es.begin ());
+    for (; i != es.end (); ++i)
+    {
+      if (i->Group == clang::frontend::System        ||
+          i->Group == clang::frontend::ExternCSystem ||
+          i->Group == clang::frontend::CSystem       ||
+          i->Group == clang::frontend::After)
+        break;
+    }
+
+    for (string const& d: ds)
+    {
+      i = es.insert (i, clang::HeaderSearchOptions::Entry (
+                       d, clang::frontend::System, false, false));
+      ++i;
+    }
+
+    return inv;
 #endif
   }
 }
