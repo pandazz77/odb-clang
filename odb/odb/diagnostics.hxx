@@ -4,7 +4,7 @@
 #ifndef ODB_DIAGNOSTICS_HXX
 #define ODB_DIAGNOSTICS_HXX
 
-#include <odb/gcc-fwd.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <string>
 #include <cstddef>

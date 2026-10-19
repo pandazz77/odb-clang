@@ -4,7 +4,7 @@
 #ifndef ODB_PARSER_HXX
 #define ODB_PARSER_HXX
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <memory>  // std::unique_ptr
 

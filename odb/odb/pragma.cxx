@@ -1,7 +1,7 @@
 // file      : odb/pragma.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
 #include <cctype> // std::isalnum
 #include <limits>
@@ -17,10 +17,26 @@
 #include <odb/context.hxx>
 #include <odb/relational/context.hxx>
 
+#include <clang/Basic/TargetInfo.h>
+#include <clang/Lex/LiteralSupport.h>
+#include <clang/Lex/Pragma.h>
+#include <clang/Lex/Preprocessor.h>
+
 using namespace std;
 using namespace cutl;
 
 using container::any;
+
+// The scope of the pragma currently being processed (see
+// process_odb_pragmas() below).
+//
+static tree current_scope_;
+
+static inline tree
+current_scope ()
+{
+  return current_scope_;
+}
 
 virt_declarations virt_declarations_;
 loc_pragmas loc_pragmas_;
@@ -253,52 +269,36 @@ parse_expression (cxx_lexer& l,
         {
         case INTEGER_CST:
           {
-            tree type (TREE_TYPE (tn));
-            unsigned long long v (integer_value (tn));
+            tree_int_cst const& c (
+              *static_cast<tree_int_cst const*> (tn.ptr ()));
 
             ostringstream os;
-            os << v;
+            os << c.value;
 
-            if (type == long_long_integer_type_node)
-              os << "LL";
-            else if (type == long_long_unsigned_type_node)
-              os << "ULL";
-            else if (type == long_integer_type_node)
-              os << "L";
-            else if (type == long_unsigned_type_node)
-              os << "UL";
-            else if (
-              TYPE_UNSIGNED (type) &&
-              TYPE_PRECISION (type) >= TYPE_PRECISION (integer_type_node))
-              os << "U";
+            switch (c.type)
+            {
+            case cst_long_long:          os << "LL"; break;
+            case cst_unsigned_long_long: os << "ULL"; break;
+            case cst_long:               os << "L"; break;
+            case cst_unsigned_long:      os << "UL"; break;
+            case cst_unsigned:           os << "U"; break;
+            default:                     break;
+            }
 
             ct.literal = os.str ();
             break;
           }
         case REAL_CST:
           {
-            tree type (TREE_TYPE (tn));
-            REAL_VALUE_TYPE val (TREE_REAL_CST (tn));
+            tree_real_cst const& c (
+              *static_cast<tree_real_cst const*> (tn.ptr ()));
 
-            // This is the best we can do. val cannot be INF or NaN.
-            //
-            char tmp[256];
-            real_to_decimal (tmp, &val, sizeof (tmp), 0, true);
-            istringstream is (tmp);
             ostringstream os;
 
-            if (type == float_type_node)
-            {
-              float f;
-              is >> f;
-              os << f << 'F';
-            }
+            if (c.type == cst_float)
+              os << static_cast<float> (c.value) << 'F';
             else
-            {
-              double d;
-              is >> d;
-              os << d;
-            }
+              os << c.value;
 
             ct.literal = os.str ();
             break;
@@ -2411,19 +2411,8 @@ handle_pragma (cxx_lexer& l,
           }
         case REAL_CST:
           {
-            REAL_VALUE_TYPE d (TREE_REAL_CST (tn));
-
-            if (REAL_VALUE_ISINF (d))
-              dv.float_value = numeric_limits<double>::infinity ();
-            else if (REAL_VALUE_ISNAN (d))
-              dv.float_value = numeric_limits<double>::quiet_NaN ();
-            else
-            {
-              char tmp[256];
-              real_to_decimal (tmp, &d, sizeof (tmp), 0, true);
-              istringstream is (tmp);
-              is >> dv.float_value;
-            }
+            dv.float_value = static_cast<tree_real_cst const*> (
+              tn.ptr ())->value;
 
             if (dv.literal == "-")
               dv.float_value = -dv.float_value;
@@ -4341,12 +4330,9 @@ handle_pragma_db_virtual (cpp_reader* r)
 }
 */
 
-extern "C" void
-handle_pragma_db (cpp_reader*)
+static void
+handle_pragma_db (cxx_lexer& l)
 {
-  cxx_pragma_lexer l;
-  l.start ();
-
   string tl;
   cpp_ttype tt (l.next (tl));
 
@@ -4359,73 +4345,297 @@ handle_pragma_db (cpp_reader*)
   handle_pragma_qualifier (l, tl);
 }
 
-extern "C" void
-register_odb_pragmas (void*, void*)
+namespace
 {
-  // GCC has a limited number of pragma slots and we have exhausted them.
-  // A workaround is to make 'db' a pragma rather than a namespace. This
-  // way we only have one pragma but the drawback of this approach is the
-  // fact that the specifier or qualifier name will now be macro-expanded
-  // (though this happens anyway if we have multiple specifiers in a single
-  // pragma). Once the GCC folks fix this, we can go back to the namespace
-  // approach.
-  //
-  // NOTE: the commented-out old code (above and below) is outdated.
-  //
-  c_register_pragma_with_expansion (0, "db", handle_pragma_db);
+  struct deferred_pragma
+  {
+    location_t loc;
+    cxx_tokens tokens;
+  };
 
-  /*
-  c_register_pragma_with_expansion ("db", "mysql", handle_pragma_db_mysql);
-  c_register_pragma_with_expansion ("db", "sqlite", handle_pragma_db_sqlite);
-  c_register_pragma_with_expansion ("db", "pgsql", handle_pragma_db_pgsql);
-  c_register_pragma_with_expansion ("db", "oracle", handle_pragma_db_oracle);
-  c_register_pragma_with_expansion ("db", "mssql", handle_pragma_db_mssql);
-  c_register_pragma_with_expansion ("db", "model", handle_pragma_db_model);
-  c_register_pragma_with_expansion ("db", "map", handle_pragma_db_map);
-  c_register_pragma_with_expansion ("db", "namespace", handle_pragma_db_namespace);
-  c_register_pragma_with_expansion ("db", "object", handle_pragma_db_object);
-  c_register_pragma_with_expansion ("db", "view", handle_pragma_db_view);
-  c_register_pragma_with_expansion ("db", "value", handle_pragma_db_value);
-  c_register_pragma_with_expansion ("db", "member", handle_pragma_db_member);
-  c_register_pragma_with_expansion ("db", "id", handle_pragma_db_id);
-  c_register_pragma_with_expansion ("db", "auto", handle_pragma_db_auto);
-  c_register_pragma_with_expansion ("db", "column", handle_pragma_db_column);
-  c_register_pragma_with_expansion ("db", "value_column", handle_pragma_db_vcolumn);
-  c_register_pragma_with_expansion ("db", "index_column", handle_pragma_db_icolumn);
-  c_register_pragma_with_expansion ("db", "key_column", handle_pragma_db_kcolumn);
-  c_register_pragma_with_expansion ("db", "id_column", handle_pragma_db_idcolumn);
-  c_register_pragma_with_expansion ("db", "options", handle_pragma_db_options);
-  c_register_pragma_with_expansion ("db", "value_options", handle_pragma_db_voptions);
-  c_register_pragma_with_expansion ("db", "index_options", handle_pragma_db_ioptions);
-  c_register_pragma_with_expansion ("db", "key_options", handle_pragma_db_koptions);
-  c_register_pragma_with_expansion ("db", "id_options", handle_pragma_db_idoptions);
-  c_register_pragma_with_expansion ("db", "type", handle_pragma_db_type);
-  c_register_pragma_with_expansion ("db", "id_type", handle_pragma_db_id_type);
-  c_register_pragma_with_expansion ("db", "value_type", handle_pragma_db_vtype);
-  c_register_pragma_with_expansion ("db", "index_type", handle_pragma_db_itype);
-  c_register_pragma_with_expansion ("db", "key_type", handle_pragma_db_ktype);
-  c_register_pragma_with_expansion ("db", "table", handle_pragma_db_table);
-  c_register_pragma_with_expansion ("db", "null", handle_pragma_db_null);
-  c_register_pragma_with_expansion ("db", "not_null", handle_pragma_db_not_null);
-  c_register_pragma_with_expansion ("db", "key_null", handle_pragma_db_key_null);
-  c_register_pragma_with_expansion ("db", "key_not_null", handle_pragma_db_key_not_null);
-  c_register_pragma_with_expansion ("db", "value_null", handle_pragma_db_value_null);
-  c_register_pragma_with_expansion ("db", "value_not_null", handle_pragma_db_value_not_null);
-  c_register_pragma_with_expansion ("db", "default", handle_pragma_db_default);
-  c_register_pragma_with_expansion ("db", "section", handle_pragma_db_section);
-  c_register_pragma_with_expansion ("db", "load", handle_pragma_db_load);
-  c_register_pragma_with_expansion ("db", "update", handle_pragma_db_update);
-  c_register_pragma_with_expansion ("db", "inverse", handle_pragma_db_inverse);
-  c_register_pragma_with_expansion ("db", "on_delete", handle_pragma_db_on_delete);
-  c_register_pragma_with_expansion ("db", "points_to", handle_pragma_db_points_to);
-  c_register_pragma_with_expansion ("db", "unordered", handle_pragma_db_unordered);
-  c_register_pragma_with_expansion ("db", "readonly", handle_pragma_db_readonly);
-  c_register_pragma_with_expansion ("db", "transient", handle_pragma_db_transient);
-  c_register_pragma_with_expansion ("db", "added", handle_pragma_db_added);
-  c_register_pragma_with_expansion ("db", "deleted", handle_pragma_db_deleted);
-  c_register_pragma_with_expansion ("db", "version", handle_pragma_db_version);
-  c_register_pragma_with_expansion ("db", "virtual", handle_pragma_db_virtual);
-  */
+  vector<deferred_pragma> deferred_pragmas_;
+
+  // Convert a numeric literal token into an INTEGER_CST/REAL_CST node
+  // similar to what GCC's pragma lexer does (the type is determined
+  // according to the C++ rules). Return the null tree on error.
+  //
+  tree
+  make_number (clang::Preprocessor& pp, clang::Token const& t)
+  {
+    llvm::SmallString<64> buf;
+    bool invalid (false);
+    llvm::StringRef spelling (pp.getSpelling (t, buf, &invalid));
+
+    if (invalid)
+      return tree ();
+
+    clang::NumericLiteralParser lp (spelling,
+                                    t.getLocation (),
+                                    pp.getSourceManager (),
+                                    pp.getLangOpts (),
+                                    pp.getTargetInfo (),
+                                    pp.getDiagnostics ());
+    if (lp.hadError)
+      return tree ();
+
+    if (lp.isIntegerLiteral ())
+    {
+      llvm::APInt v (64, 0);
+
+      if (lp.GetIntegerValue (v))
+        return tree (); // Overflow.
+
+      unsigned long long uv (v.getZExtValue ());
+
+      clang::TargetInfo const& ti (pp.getTargetInfo ());
+      unsigned iw (ti.getIntWidth ()), lw (ti.getLongWidth ());
+
+      unsigned long long int_max ((1ULL << (iw - 1)) - 1);
+      unsigned long long long_max ((1ULL << (lw - 1)) - 1);
+      unsigned long long uint_max (iw >= 64 ? ~0ULL : (1ULL << iw) - 1);
+      unsigned long long ulong_max (lw >= 64 ? ~0ULL : (1ULL << lw) - 1);
+      unsigned long long llong_max (0x7FFFFFFFFFFFFFFFULL);
+
+      bool dec (lp.getRadix () == 10);
+      bool u (lp.isUnsigned);
+      cst_type ct;
+
+      if (!lp.isLong && !lp.isLongLong && !u && uv <= int_max)
+        ct = cst_int;
+      else if (!lp.isLong && !lp.isLongLong && (u || !dec) && uv <= uint_max)
+        ct = cst_unsigned;
+      else if (!lp.isLongLong && !u && uv <= long_max)
+        ct = cst_long;
+      else if (!lp.isLongLong && (u || !dec) && uv <= ulong_max)
+        ct = cst_unsigned_long;
+      else if (!u && uv <= llong_max)
+        ct = cst_long_long;
+      else
+        ct = cst_unsigned_long_long;
+
+      return make_int_cst (ct, uv);
+    }
+    else if (lp.isFloatingLiteral ())
+    {
+      llvm::APFloat v (llvm::APFloat::IEEEdouble ());
+      lp.GetFloatValue (v, llvm::RoundingMode::NearestTiesToEven);
+
+      cst_type ct (lp.isFloat
+                   ? cst_float
+                   : lp.isLong ? cst_long_double : cst_double);
+
+      return make_real_cst (ct, v.convertToDouble (), spelling.str ());
+    }
+
+    return tree ();
+  }
+
+  struct db_pragma_handler: clang::PragmaHandler
+  {
+    db_pragma_handler (): clang::PragmaHandler ("db") {}
+
+    virtual void
+    HandlePragma (clang::Preprocessor& pp,
+                  clang::PragmaIntroducer intro,
+                  clang::Token&)
+    {
+      clang::SourceManager& sm (pp.getSourceManager ());
+
+      deferred_pragmas_.push_back (deferred_pragma ());
+      deferred_pragma& p (deferred_pragmas_.back ());
+      p.loc = location_t (
+        sm.getExpansionLoc (intro.Loc).getRawEncoding ());
+
+      // Collect the (macro-expanded) pragma tokens.
+      //
+      for (;;)
+      {
+        clang::Token t;
+        pp.Lex (t);
+
+        clang::tok::TokenKind k (t.getKind ());
+
+        if (k == clang::tok::eod || k == clang::tok::eof)
+          break;
+
+        location_t loc (
+          sm.getExpansionLoc (t.getLocation ()).getRawEncoding ());
+
+        cpp_ttype tt (odbc::token_type (k));
+        string lit;
+        tree node;
+
+        switch (tt)
+        {
+        case CPP_NAME:
+        case CPP_KEYWORD:
+          {
+            if (clang::IdentifierInfo* ii = t.getIdentifierInfo ())
+              lit = ii->getName ().str ();
+            else
+              lit = pp.getSpelling (t);
+
+            tt = odbc::keyword_p (lit) ? CPP_KEYWORD : CPP_NAME;
+            break;
+          }
+        case CPP_STRING:
+        case CPP_WSTRING:
+        case CPP_STRING16:
+        case CPP_STRING32:
+        case CPP_UTF8STRING:
+          {
+            // Like GCC's pragma lexer, join adjacent string literals and
+            // return the string value without the quotes and with escape
+            // sequences processed.
+            //
+            llvm::SmallVector<clang::Token, 4> ts (1, t);
+
+            while (clang::tok::isStringLiteral (pp.LookAhead (0).getKind ()))
+            {
+              clang::Token n;
+              pp.Lex (n);
+              ts.push_back (n);
+            }
+
+            clang::StringLiteralParser lp (ts, pp);
+            if (lp.hadError)
+              lit = pp.getSpelling (t);
+            else
+              lit = lp.GetString ().str ();
+
+            tt = CPP_STRING;
+            break;
+          }
+        case CPP_NUMBER:
+          {
+            node = make_number (pp, t);
+            lit = pp.getSpelling (t);
+
+            if (!node)
+              node = error_mark_node;
+            break;
+          }
+        case N_TTYPES:
+          {
+            tt = CPP_OTHER;
+            lit = pp.getSpelling (t);
+            break;
+          }
+        default:
+          {
+            lit = pp.getSpelling (t);
+            break;
+          }
+        }
+
+        p.tokens.push_back (cxx_token (loc, tt, lit, node));
+      }
+    }
+  };
+
+  // Return true if the declaration's source range contains the location.
+  //
+  bool
+  contains (clang::Decl const* d, clang::SourceLocation l)
+  {
+    clang::SourceManager& sm (odbc::sm ());
+    clang::SourceRange r (d->getSourceRange ());
+
+    if (r.isInvalid ())
+      return false;
+
+    clang::SourceLocation b (sm.getExpansionLoc (r.getBegin ()));
+    clang::SourceLocation e (sm.getExpansionLoc (r.getEnd ()));
+
+    return !sm.isBeforeInTranslationUnit (l, b) &&
+      !sm.isBeforeInTranslationUnit (e, l);
+  }
+
+  // Find the innermost namespace or class that lexically contains the
+  // location. This is the equivalent of GCC's current_scope() at the
+  // point where the pragma was encountered.
+  //
+  clang::DeclContext*
+  scope_at (clang::DeclContext* dc, clang::SourceLocation l)
+  {
+    using namespace clang;
+
+    for (;;)
+    {
+      DeclContext* n (0);
+
+      for (Decl* d: dc->decls ())
+      {
+        DeclContext* c (0);
+
+        if (NamespaceDecl* ns = dyn_cast<NamespaceDecl> (d))
+          c = ns;
+        else if (LinkageSpecDecl* ls = dyn_cast<LinkageSpecDecl> (d))
+          c = ls;
+        else if (ExportDecl* ed = dyn_cast<ExportDecl> (d))
+          c = ed;
+        else if (CXXRecordDecl* r = dyn_cast<CXXRecordDecl> (d))
+        {
+          if (ClassTemplateSpecializationDecl* s =
+                dyn_cast<ClassTemplateSpecializationDecl> (r))
+          {
+            if (s->getSpecializationKind () == TSK_ImplicitInstantiation)
+              continue;
+          }
+
+          if (r->isThisDeclarationADefinition ())
+            c = r;
+        }
+        else if (ClassTemplateDecl* t = dyn_cast<ClassTemplateDecl> (d))
+        {
+          CXXRecordDecl* r (t->getTemplatedDecl ());
+
+          if (r->isThisDeclarationADefinition ())
+            c = r;
+        }
+
+        if (c != 0 && contains (d, l))
+        {
+          n = c;
+          break;
+        }
+      }
+
+      if (n == 0)
+        return dc;
+
+      dc = n;
+    }
+  }
+}
+
+void
+register_odb_pragmas (clang::Preprocessor& pp)
+{
+  // Note that similar to the GCC plugin we register 'db' as a pragma
+  // rather than a namespace so that the specifier or qualifier name is
+  // macro-expanded.
+  //
+  pp.AddPragmaHandler (new db_pragma_handler);
+}
+
+void
+process_odb_pragmas ()
+{
+  clang::TranslationUnitDecl* tu (odbc::ast ().getTranslationUnitDecl ());
+
+  for (deferred_pragma const& p: deferred_pragmas_)
+  {
+    clang::SourceLocation l (odbc::source_location (p.loc));
+    current_scope_ = odbc::make_scope (scope_at (tu, l));
+
+    cxx_tokens_lexer lex;
+    lex.start (p.tokens, p.loc);
+    handle_pragma_db (lex);
+  }
+
+  current_scope_ = tree ();
+  deferred_pragmas_.clear ();
 }
 
 void
@@ -4491,12 +4701,7 @@ post_process_pragmas ()
     tree decl (TYPE_NAME (p->value.value<tree> ()));
     location_t loc (real_source_location (decl));
 
-    // Reset input location so that we get nice diagnostics in case
-    // of an error.
-    //
-    input_location = loc;
-
-    if (instantiate_class_template (type) == error_mark_node ||
+    if (instantiate_class_template (type, loc) == error_mark_node ||
         errorcount != 0 ||
         !COMPLETE_TYPE_P (type))
     {

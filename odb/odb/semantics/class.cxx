@@ -1,7 +1,7 @@
 // file      : odb/semantics/class.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx> // TYPE_HAS_DEFAULT_CONSTRUCTOR
+#include <odb/clang.hxx>
 
 #include <libcutl/compiler/type-info.hxx>
 #include <odb/semantics/class.hxx>
@@ -23,41 +23,16 @@ namespace semantics
   bool class_::
   default_ctor () const
   {
-    tree t (tree_node ());
+    clang::CXXRecordDecl* r (odbc::record_decl (tree_node ()));
 
-    // TYPE_HAS_DEFAULT_CONSTRUCTOR() returns true if we have a deleted
-    // default ctor. locate_ctor(), on the other hand, returns NULL_TREE in
-    // this case.
+    if (r == 0 || !r->hasDefinition ())
+      return false;
+
+    // Note that this also declares the implicit default ctor, if needed,
+    // which determines whether it is deleted.
     //
-    if (TYPE_HAS_DEFAULT_CONSTRUCTOR (t))
-    {
-#if BUILDING_GCC_MAJOR >= 8
-
-      // Work around GCC bug 86441. Essentially, we should not trigger an
-      // instantiation or completion of the default ctor. As a result, we will
-      // assume that if we have a lazy default ctor, it is not implicitly
-      // deleted.
-      //
-      if (CLASSTYPE_LAZY_DEFAULT_CTOR (t))
-        return true;
-
-      for (ovl_iterator i (CLASSTYPE_CONSTRUCTORS (t)); i; ++i)
-      {
-        tree f (*i);
-
-        if (TREE_CODE (f) == FUNCTION_DECL && DECL_DELETED_FN (f))
-          continue;
-
-        if (default_ctor_p (f))
-          return true;
-      }
-#else
-      return locate_ctor (t) != NULL_TREE;
-#endif
-
-    }
-
-    return false;
+    clang::CXXConstructorDecl* c (odbc::sema_->LookupDefaultConstructor (r));
+    return c != 0 && !c->isDeleted ();
   }
 
   bool class_::
@@ -69,7 +44,8 @@ namespace semantics
   bool class_::
   abstract () const
   {
-    return CLASSTYPE_PURE_VIRTUALS (tree_node ());
+    clang::CXXRecordDecl* r (odbc::record_decl (tree_node ()));
+    return r != 0 && r->hasDefinition () && r->isAbstract ();
   }
 
   names* class_::

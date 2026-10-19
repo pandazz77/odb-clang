@@ -1,7 +1,7 @@
 // file      : odb/relational/processor.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <vector>
 #include <algorithm>

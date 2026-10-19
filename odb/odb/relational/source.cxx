@@ -3,7 +3,7 @@
 
 #include <map>
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <odb/lookup.hxx>
 #include <odb/cxx-lexer.hxx>

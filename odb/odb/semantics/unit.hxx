@@ -26,14 +26,15 @@ namespace semantics
     node*
     find (tree key) const
     {
-      tree_node_map::const_iterator i (tree_node_map_.find (key));
+      tree_node_map::const_iterator i (
+        tree_node_map_.find (tree_node_key (key)));
       return i != tree_node_map_.end () ? i->second : 0;
     }
 
     void
     insert (tree key, node& value)
     {
-      tree_node_map_[key] = &value;
+      tree_node_map_[tree_node_key (key)] = &value;
     }
 
     using namespace_::find;
@@ -44,14 +45,20 @@ namespace semantics
     names*
     find_hint (tree key) const
     {
-      name_hint_map::const_iterator i (name_hint_map_.find (key));
+      tree k (tree_hint_key (key));
+
+      if (!k)
+        return 0;
+
+      name_hint_map::const_iterator i (name_hint_map_.find (k));
       return i != name_hint_map_.end () ? i->second : 0;
     }
 
     void
     insert_hint (tree key, names& name)
     {
-      name_hint_map_[key] = &name;
+      if (tree k = tree_hint_key (key))
+        name_hint_map_[k] = &name;
     }
 
   public:

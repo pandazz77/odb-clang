@@ -4,18 +4,12 @@
 #ifndef ODB_CXX_LEXER_HXX
 #define ODB_CXX_LEXER_HXX
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <string>
+#include <cstddef> // std::size_t
 
 #include <odb/cxx-token.hxx>
-
-// A C++ keyword. This is an extension to libcpp token types. GCC 4.7.0
-// adds this define.
-//
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-#  define CPP_KEYWORD ((cpp_ttype) (N_TTYPES + 1))
-#endif
 
 class cxx_lexer
 {
@@ -61,45 +55,8 @@ private:
 };
 
 
-// A thin wrapper around the pragma_lex() function that recognizes
-// CPP_KEYWORD. It returns numbers as tree nodes.
-//
-class cxx_pragma_lexer: public cxx_lexer
-{
-public:
-  void
-  start ();
-
-  // Start with an already extracted (using the pragma_lex() function)
-  // token. This function translates the CPP_NAME to CPP_KEYWORD if
-  // necessary and returns the string token. It also uses the passed
-  // token and type for subsequent calls to next() so after the last
-  // next() call they will contain the information about the last
-  // token parsed.
-  //
-  std::string
-  start (tree& token, cpp_ttype& type);
-
-  virtual cpp_ttype
-  next (std::string& token, tree* node = 0);
-
-  virtual location_t
-  location () const;
-
-private:
-  std::string
-  translate ();
-
-private:
-  tree* token_;
-  cpp_ttype* type_;
-
-  tree token_data_;
-  cpp_ttype type_data_;
-};
-
-// A thin wrapper around cpp_reader for lexing C++ code fragments. It
-// returns numbers as string literals.
+// A thin wrapper around the Clang raw lexer for lexing C++ code fragments.
+// It returns numbers as string literals.
 //
 class cxx_string_lexer: public cxx_lexer
 {
@@ -120,11 +77,14 @@ public:
   location () const;
 
 private:
+  cxx_string_lexer (cxx_string_lexer const&);
+  cxx_string_lexer& operator= (cxx_string_lexer const&);
+
+  struct impl;
+
   std::string data_;
   std::string buf_;
-  line_maps line_map_;
-  cpp_reader* reader_;
-  cpp_callbacks* callbacks_;
+  impl* impl_;
   location_t loc_;
 };
 

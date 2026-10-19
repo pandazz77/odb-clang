@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include <odb/gcc-fwd.hxx>
+#include <odb/clang-fwd.hxx>
 
 struct cxx_token
 {

@@ -1,7 +1,7 @@
 // file      : odb/diagnostics.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <sstream>
 

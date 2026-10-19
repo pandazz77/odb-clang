@@ -4,7 +4,7 @@
 #ifndef ODB_LOCATION_HXX
 #define ODB_LOCATION_HXX
 
-#include <odb/gcc-fwd.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <cstddef>
 #include <libcutl/fs/path.hxx>

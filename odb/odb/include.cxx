@@ -1,7 +1,7 @@
 // file      : odb/include.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
 #include <set>
 #include <map>
@@ -29,18 +29,24 @@ namespace
     path path_;
   };
 
-#if BUILDING_GCC_MAJOR >= 6
-  typedef line_map_ordinary line_map_type;
-#else
-  typedef line_map line_map_type;
-# ifndef linemap_check_ordinary
-#   define linemap_check_ordinary(X) (X)
-# endif
-#endif
+  // Include site (the #include directive location) ordered by its
+  // position in the translation unit.
+  //
+  struct site_comparator
+  {
+    bool
+    operator() (odbc::include_site const& x,
+                odbc::include_site const& y) const
+    {
+      return x.id < y.id;
+    }
+  };
 
   struct includes
   {
-    typedef std::map<line_map_type const*, include_directive> map_type;
+    typedef std::map<odbc::include_site,
+                     include_directive,
+                     site_comparator> map_type;
     bool trailing; // Included at the beginning or at the end of the main file.
     map_type map;
   };
@@ -154,14 +160,10 @@ namespace
       //
       if (l > BUILTINS_LOCATION)
       {
-        line_map_type const* lm (
-          linemap_check_ordinary (
-            linemap_lookup (line_table, l)));
+        odbc::include_site lm;
 
-        if (lm != 0 && !MAIN_FILE_P (lm))
+        if (odbc::included_from (l, lm))
         {
-          lm = INCLUDED_FROM (line_table, lm);
-
           f.complete ();
           f.normalize ();
 
@@ -547,28 +549,9 @@ namespace
 
     // Add all the known include locations for each file in the map.
     //
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-    size_t used (line_table->used);
-    line_map_type const* maps (line_table->maps);
-#else
-    size_t used (line_table->info_ordinary.used);
-    line_map_type const* maps (line_table->info_ordinary.maps);
-#endif
-
-    for (size_t i (0); i < used; ++i)
+    for (odbc::include_site const& ifm: odbc::include_sites ())
     {
-      line_map_type const* m (maps + i);
-
-      if (MAIN_FILE_P (m) || m->reason != LC_ENTER)
-        continue;
-
-      line_map_type const* ifm (INCLUDED_FROM (line_table, m));
-
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-      path f (m->to_file);
-#else
-      path f (ORDINARY_MAP_FILE_NAME (m));
-#endif
+      path f (ifm.included);
 
       f.complete ();
       f.normalize ();
@@ -604,20 +587,19 @@ namespace
       // it is preferred over all others. Use the first one if there are
       // several.
       //
-      line_map_type const* main_lm (0);
+      odbc::include_site const* main_lm (0);
       include_directive* main_inc (0);
 
       for (includes::map_type::iterator j (i->second.map.begin ());
            j != i->second.map.end (); ++j)
       {
-        line_map_type const* lm (j->first);
+        odbc::include_site const& lm (j->first);
 
-        if (MAIN_FILE_P (lm))
+        if (lm.main)
         {
-          if (main_lm == 0 ||
-              LAST_SOURCE_LINE (main_lm) > LAST_SOURCE_LINE (lm))
+          if (main_lm == 0 || main_lm->line > lm.line)
           {
-            main_lm = lm;
+            main_lm = &lm;
             main_inc = &j->second;
           }
         }
@@ -625,11 +607,7 @@ namespace
 
       if (main_lm != 0)
       {
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-        string f (main_lm->to_file);
-#else
-        string f (ORDINARY_MAP_FILE_NAME (main_lm));
-#endif
+        string f (main_lm->file);
         size_t n (f.size ());
 
         // Check if this is a synthesized fragment.
@@ -642,7 +620,7 @@ namespace
           f = p.string ();
         }
 
-        fmap[f][LAST_SOURCE_LINE (main_lm)] = main_inc;
+        fmap[f][main_lm->line] = main_inc;
         continue;
       }
 
@@ -651,13 +629,8 @@ namespace
       for (includes::map_type::iterator j (i->second.map.begin ());
            j != i->second.map.end (); ++j)
       {
-        line_map_type const* lm (j->first);
-
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-        string f (lm->to_file);
-#else
-        string f (ORDINARY_MAP_FILE_NAME (lm));
-#endif
+        odbc::include_site const& lm (j->first);
+        string f (lm.file);
         size_t n (f.size ());
 
         // Check if this is a synthesized fragment.
@@ -670,7 +643,7 @@ namespace
           f = p.string ();
         }
 
-        fmap[f][LAST_SOURCE_LINE (lm)] = &j->second;
+        fmap[f][lm.line] = &j->second;
       }
     }
 

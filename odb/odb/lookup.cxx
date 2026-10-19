@@ -164,7 +164,7 @@ namespace lookup
                        bool trailing_scope,
                        tree* end_scope)
   {
-    tree id;
+    string id;
     bool first (true);
 
     if (tt == CPP_SCOPE)
@@ -184,7 +184,7 @@ namespace lookup
       {
         tree decl (
           lookup_qualified_name (
-            global_namespace, get_identifier (t.c_str ()), true, false));
+            global_namespace, t, true, false));
 
         if (decl == error_mark_node)
           throw unable_to_resolve (name, true);
@@ -205,7 +205,7 @@ namespace lookup
         throw invalid_name ();
 
       name += tl;
-      id = get_identifier (tl.c_str ());
+      id = tl;
       ptt = tt;
       tt = l.next (tl, &tn);
 

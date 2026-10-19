@@ -1,14 +1,14 @@
 // file      : odb/cxx-lexer.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
-#include <stdio.h>
-#include <stdarg.h>
-
-#include <new>      // std::bad_alloc
 #include <cassert>
 #include <iostream>
+
+#include <clang/Basic/IdentifierTable.h>
+#include <clang/Basic/LangOptions.h>
+#include <clang/Lex/Lexer.h>
 
 #include <odb/cxx-lexer.hxx>
 
@@ -29,6 +29,133 @@ char const* cxx_lexer::token_spelling[N_TTYPES + 1] = { TTYPE_TABLE "KEYWORD"};
 cxx_lexer::
 ~cxx_lexer ()
 {
+}
+
+namespace odbc
+{
+  cpp_ttype
+  token_type (clang::tok::TokenKind k)
+  {
+    using namespace clang::tok;
+
+    switch (k)
+    {
+    case clang::tok::equal:                return CPP_EQ;
+    case exclaim:              return CPP_NOT;
+    case clang::tok::greater:              return CPP_GREATER;
+    case clang::tok::less:                 return CPP_LESS;
+    case clang::tok::plus:                 return CPP_PLUS;
+    case clang::tok::minus:                return CPP_MINUS;
+    case star:                 return CPP_MULT;
+    case slash:                return CPP_DIV;
+    case percent:              return CPP_MOD;
+    case amp:                  return CPP_AND;
+    case pipe:                 return CPP_OR;
+    case caret:                return CPP_XOR;
+    case greatergreater:       return CPP_RSHIFT;
+    case lessless:             return CPP_LSHIFT;
+    case tilde:                return CPP_COMPL;
+    case ampamp:               return CPP_AND_AND;
+    case pipepipe:             return CPP_OR_OR;
+    case question:             return CPP_QUERY;
+    case colon:                return CPP_COLON;
+    case comma:                return CPP_COMMA;
+    case l_paren:              return CPP_OPEN_PAREN;
+    case r_paren:              return CPP_CLOSE_PAREN;
+    case eof:
+    case eod:                  return CPP_EOF;
+    case equalequal:           return CPP_EQ_EQ;
+    case exclaimequal:         return CPP_NOT_EQ;
+    case greaterequal:         return CPP_GREATER_EQ;
+    case lessequal:            return CPP_LESS_EQ;
+    case spaceship:            return CPP_SPACESHIP;
+    case plusequal:            return CPP_PLUS_EQ;
+    case minusequal:           return CPP_MINUS_EQ;
+    case starequal:            return CPP_MULT_EQ;
+    case slashequal:           return CPP_DIV_EQ;
+    case percentequal:         return CPP_MOD_EQ;
+    case ampequal:             return CPP_AND_EQ;
+    case pipeequal:            return CPP_OR_EQ;
+    case caretequal:           return CPP_XOR_EQ;
+    case greatergreaterequal:  return CPP_RSHIFT_EQ;
+    case lesslessequal:        return CPP_LSHIFT_EQ;
+    case clang::tok::hash:                 return CPP_HASH;
+    case hashhash:             return CPP_PASTE;
+    case l_square:             return CPP_OPEN_SQUARE;
+    case r_square:             return CPP_CLOSE_SQUARE;
+    case l_brace:              return CPP_OPEN_BRACE;
+    case r_brace:              return CPP_CLOSE_BRACE;
+    case semi:                 return CPP_SEMICOLON;
+    case ellipsis:             return CPP_ELLIPSIS;
+    case plusplus:             return CPP_PLUS_PLUS;
+    case minusminus:           return CPP_MINUS_MINUS;
+    case arrow:                return CPP_DEREF;
+    case period:               return CPP_DOT;
+    case coloncolon:           return CPP_SCOPE;
+    case arrowstar:            return CPP_DEREF_STAR;
+    case periodstar:           return CPP_DOT_STAR;
+    case at:                   return CPP_ATSIGN;
+    case identifier:
+    case raw_identifier:       return CPP_NAME;
+    case numeric_constant:     return CPP_NUMBER;
+    case char_constant:        return CPP_CHAR;
+    case wide_char_constant:   return CPP_WCHAR;
+    case utf16_char_constant:  return CPP_CHAR16;
+    case utf32_char_constant:  return CPP_CHAR32;
+    case utf8_char_constant:   return CPP_UTF8CHAR;
+    case string_literal:       return CPP_STRING;
+    case wide_string_literal:  return CPP_WSTRING;
+    case utf8_string_literal:  return CPP_UTF8STRING;
+    case utf16_string_literal: return CPP_STRING16;
+    case utf32_string_literal: return CPP_STRING32;
+    case header_name:          return CPP_HEADER_NAME;
+    case comment:              return CPP_COMMENT;
+    case unknown:              return CPP_OTHER;
+    default:
+      break;
+    }
+
+    if (getKeywordSpelling (k) != 0)
+      return CPP_KEYWORD;
+
+    return N_TTYPES;
+  }
+
+  static clang::LangOptions
+  default_lang_options ()
+  {
+    clang::LangOptions lo;
+    lo.CPlusPlus = lo.CPlusPlus11 = lo.CPlusPlus14 = lo.CPlusPlus17 = 1;
+    lo.Bool = 1;
+    lo.WChar = 1;
+    lo.CXXOperatorNames = 1;
+    lo.LineComment = 1;
+    lo.Digraphs = 1;
+    return lo;
+  }
+
+  static clang::LangOptions const&
+  lang_options ()
+  {
+    if (ast_context != 0)
+      return ast_context->getLangOpts ();
+
+    static clang::LangOptions lo (default_lang_options ());
+    return lo;
+  }
+
+  bool
+  keyword_p (llvm::StringRef n)
+  {
+    if (ast_context != 0)
+    {
+      clang::IdentifierInfo& ii (ast_context->Idents.get (n));
+      return ii.isKeyword (ast_context->getLangOpts ());
+    }
+
+    static clang::IdentifierTable it (lang_options ());
+    return it.get (n).isKeyword (lang_options ());
+  }
 }
 
 //
@@ -65,296 +192,98 @@ location () const
 }
 
 //
-// cxx_pragma_lexer
-//
-
-void cxx_pragma_lexer::
-start ()
-{
-  token_ = &token_data_;
-  type_ = &type_data_;
-}
-
-string cxx_pragma_lexer::
-start (tree& token, cpp_ttype& type)
-{
-  token_ = &token;
-  type_ = &type;
-
-  return translate ();
-}
-
-cpp_ttype cxx_pragma_lexer::
-next (string& token, tree* node)
-{
-  *type_ = pragma_lex (token_);
-
-  // See if this is a keyword using the C++ parser machinery and
-  // the current C++ dialect.
-  //
-  if (*type_ == CPP_NAME &&
-#if BUILDING_GCC_MAJOR >= 8
-      IDENTIFIER_KEYWORD_P (*token_)
-#else
-      C_IS_RESERVED_WORD (*token_)
-#endif
-  )
-    *type_ = CPP_KEYWORD;
-
-  if (node != 0 && node != token_)
-    *node = *token_;
-
-  token = translate ();
-  return *type_;
-}
-
-location_t cxx_pragma_lexer::
-location () const
-{
-  // Starting from GCC 6 the input location seem to require the same
-  // translation as what we do in real_source_location().
-  //
-#if BUILDING_GCC_MAJOR >= 6
-  return linemap_resolve_location (
-    line_table, input_location, LRK_MACRO_EXPANSION_POINT, 0);
-#else
-  return input_location;
-#endif
-}
-
-string cxx_pragma_lexer::
-translate ()
-{
-  string r;
-
-  if (*type_ == CPP_NAME || *type_ == CPP_KEYWORD)
-    r = IDENTIFIER_POINTER (*token_);
-  else if (*type_ == CPP_STRING)
-    r = TREE_STRING_POINTER (*token_);
-
-  return r;
-}
-
-//
 // cxx_string_lexer
 //
 
-// Diagnostics callback.
-//
-extern "C" bool
-cpp_diagnostic_callback (
-  cpp_reader* reader,
-#if BUILDING_GCC_MAJOR >= 9
-  cpp_diagnostic_level level,
-#else
-  int level,
-#endif
-#if BUILDING_GCC_MAJOR > 4 || BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR > 5
-#if BUILDING_GCC_MAJOR >= 9
-  cpp_warning_reason,
-#else
-  int /*reason*/, // Added in GCC 4.6.0.
-#endif
-#endif
-#if BUILDING_GCC_MAJOR <= 5
-  location_t,
-  unsigned int,
-#else
-  rich_location*,
-#endif
-  char const* msg,
-  va_list *ap)
+struct cxx_string_lexer::impl
 {
-  char const* kind (0);
-  switch (level)
+  impl (char const* b, char const* e)
+      : lexer (clang::SourceLocation (), odbc::lang_options (), b, b, e)
   {
-  case CPP_DL_NOTE:
-  case CPP_DL_WARNING_SYSHDR:
-  case CPP_DL_WARNING:
-  case CPP_DL_PEDWARN:
-    // Ignore these.
-    break;
-  case CPP_DL_ERROR:
-  case CPP_DL_FATAL:
-    kind = "error";
-    break;
-  case CPP_DL_ICE:
-    kind = "ice";
-    break;
-  default:
-    kind = "unknown";
-    break;
+    lexer.SetCommentRetentionState (false);
   }
 
-  if (kind != 0)
-  {
-    fprintf (stderr, "%s: ", kind);
-    vfprintf (stderr, msg, *ap);
-    fprintf (stderr, "\n");
-
-    // By resetting the callback we indicate to cxx_string_lexer that there
-    // was an error.
-    //
-#if BUILDING_GCC_MAJOR >= 9
-    cpp_get_callbacks (reader)->diagnostic = 0;
-#else
-    cpp_get_callbacks (reader)->error = 0;
-#endif
-    return true;
-  }
-
-  return false;
-}
+  clang::Lexer lexer;
+};
 
 cxx_string_lexer::
 cxx_string_lexer ()
-    : reader_ (0)
+    : impl_ (0)
 {
-#if BUILDING_GCC_MAJOR >= 5
-  linemap_init (&line_map_, UNKNOWN_LOCATION);
-#else
-  linemap_init (&line_map_);
-#endif
-
-#if BUILDING_GCC_MAJOR >= 14
-  line_map_.m_round_alloc_size = ggc_round_alloc_size;
-#elif BUILDING_GCC_MAJOR > 4 || BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR > 6
-  line_map_.round_alloc_size = ggc_round_alloc_size;
-#endif
-
-  linemap_add (&line_map_, LC_ENTER, 0, "<memory>", 0);
-
-  reader_ = cpp_create_reader (
-    cxx_dialect == cxx0x // Nothing new for C++14.
-#if BUILDING_GCC_MAJOR > 4 || BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR > 6
-    ? CLK_CXX11
-#else
-    ? CLK_CXX0X
-#endif
-    : CLK_CXX98,
-    0,
-    &line_map_);
-
-  if (reader_ == 0)
-    throw bad_alloc ();
-
-  callbacks_ = cpp_get_callbacks (reader_);
 }
 
 cxx_string_lexer::
 ~cxx_string_lexer ()
 {
-  if (reader_ != 0)
-    cpp_destroy (reader_);
-
-  // Was removed as "dead code" in GCC 4.7.0.
-  //
-#if BUILDING_GCC_MAJOR == 4 && BUILDING_GCC_MINOR <= 6
-  linemap_free (&line_map_);
-#endif
+  delete impl_;
 }
 
 void cxx_string_lexer::
 start (string const& data)
 {
-  // The previous lexing session should have popped the buffer.
-  //
-  assert (cpp_get_buffer (reader_) == 0);
-
-#if BUILDING_GCC_MAJOR >= 9
-  callbacks_->diagnostic = &cpp_diagnostic_callback;
-#else
-  callbacks_->error = &cpp_diagnostic_callback;
-#endif
-
   data_ = data;
   buf_ = data;
-  buf_ += '\n';
-  loc_ = 0;
+  loc_ = location_t ();
 
-  cpp_push_buffer (
-    reader_,
-    reinterpret_cast<unsigned char const*> (buf_.c_str ()),
-    buf_.size (),
-    true);
+  delete impl_;
+  impl_ = new impl (buf_.c_str (), buf_.c_str () + buf_.size ());
 }
 
 cpp_ttype cxx_string_lexer::
 next (string& token, tree* node)
 {
   token.clear ();
-  cpp_token const* t (cpp_get_token (reader_));
 
-  // If there was an error, the callback will be reset to 0. Diagnostics has
-  // already been issued.
-  //
-#if BUILDING_GCC_MAJOR >= 9
-  if (callbacks_->diagnostic == 0)
-#else
-  if (callbacks_->error == 0)
-#endif
-    throw invalid_input ();
+  if (node != 0)
+    *node = tree ();
 
-  cpp_ttype tt (t->type);
+  clang::Token t;
+  impl_->lexer.LexFromRawLexer (t);
+
+  cpp_ttype tt (odbc::token_type (t.getKind ()));
 
   switch (tt)
   {
+  case CPP_EOF:
+    break;
   case CPP_NAME:
     {
-      char const* name (
-        reinterpret_cast<char const*> (NODE_NAME (t->val.node.node)));
+      token = t.getRawIdentifier ().str ();
 
-      // See if this is a keyword using the C++ parser machinery and
-      // the current C++ dialect.
+      // See if this is a keyword in the current dialect.
       //
-      tree id (get_identifier (name));
-
-      if (
-#if BUILDING_GCC_MAJOR >= 8
-        IDENTIFIER_KEYWORD_P (id)
-#else
-        C_IS_RESERVED_WORD (id)
-#endif
-      )
+      if (odbc::keyword_p (token))
         tt = CPP_KEYWORD;
 
-      if (node != 0)
-        *node = id;
-
-      token = name;
       break;
     }
   case CPP_STRING:
   case CPP_NUMBER:
+  case CPP_CHAR:
+  case CPP_WCHAR:
+  case CPP_CHAR16:
+  case CPP_CHAR32:
+  case CPP_UTF8CHAR:
+  case CPP_WSTRING:
+  case CPP_STRING16:
+  case CPP_STRING32:
+  case CPP_UTF8STRING:
     {
-      if (node != 0)
-        *node = 0; // Doesn't seem to be available.
-
-      cpp_string const& s (t->val.str);
-      token.assign (reinterpret_cast<char const*> (s.text), s.len);
+      token.assign (t.getLiteralData (), t.getLength ());
       break;
     }
   default:
     {
       if (tt <= CPP_LAST_PUNCTUATOR)
-      {
-        if (node != 0)
-          *node = 0;
         token = token_spelling[tt];
-      }
       else
       {
-        cerr << "unexpected token '" << token_spelling[tt] << "' in '" <<
-          data_ << "'" << endl;
+        cerr << "error: unexpected token in '" << data_ << "'" << endl;
         throw invalid_input ();
       }
       break;
     }
   }
-
-  // Cache the location of this token.
-  //
-  loc_ = t->src_loc;
 
   return tt;
 }

@@ -4,7 +4,7 @@
 #ifndef ODB_CONTEXT_HXX
 #define ODB_CONTEXT_HXX
 
-#include <odb/gcc-fwd.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <map>
 #include <set>
@@ -204,9 +204,10 @@ struct default_value
   kind_type kind;
   std::string literal;
 
+  tree enum_value;
+
   union
   {
-    tree enum_value;
     unsigned long long int_value;
     double float_value;
   };

@@ -1,7 +1,7 @@
 // file      : odb/parser.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx> // Keep it first.
+#include <odb/clang.hxx>
 
 #include <set>
 #include <map>
@@ -18,6 +18,13 @@
 using namespace std;
 using namespace semantics;
 
+namespace cl = clang;
+
+// Build the semantic graph from the Clang AST. The structure follows the
+// original GCC tree-based implementation: namespace-level declarations
+// are collected and traversed in the source code order, interleaved with
+// position pragmas.
+//
 class parser::impl
 {
 public:
@@ -31,14 +38,13 @@ public:
 private:
   typedef semantics::access access;
 
-  // Extended GCC tree declaration that is either a GCC tree
-  // declaration, a virtual declaration, or a pragma. If it is
-  // a pragma, then the assoc flag indicated whether this pragma
-  // has been associated with a declaration. Otherwise, the assoc
-  // flag indicates whether pragmas have been associated with this
-  // declaration (we use this to ignore certain declarations for
-  // pragma association purposes, e.g., the anonymous type in
-  // struct {...} m_).
+  // Extended declaration that is either a real declaration, a virtual
+  // declaration, or a pragma. If it is a pragma, then the assoc flag
+  // indicated whether this pragma has been associated with a declaration.
+  // Otherwise, the assoc flag indicates whether pragmas have been
+  // associated with this declaration (we use this to ignore certain
+  // declarations for pragma association purposes, e.g., the anonymous
+  // type in struct {...} m_).
   //
   struct tree_decl
   {
@@ -61,7 +67,10 @@ private:
 
 private:
   void
-  collect (tree ns);
+  collect (cl::DeclContext const*);
+
+  void
+  collect_members (cl::CXXRecordDecl const*, decl_set&, bool templates_only);
 
   void
   emit ();
@@ -71,18 +80,18 @@ private:
   // newly created type node. In the latter case it returns 0.
   //
   type*
-  emit_type_decl (tree);
+  emit_type_decl (cl::Decl const*);
 
   // Emit a template declaration.
   //
   void
-  emit_template_decl (tree);
+  emit_template_decl (cl::ClassTemplateDecl const*);
 
   class_template&
-  emit_class_template (tree, bool stub = false);
+  emit_class_template (cl::ClassTemplateDecl const*, bool stub = false);
 
   union_template&
-  emit_union_template (tree, bool stub = false);
+  emit_union_template (cl::ClassTemplateDecl const*, bool stub = false);
 
   template <typename T>
   T&
@@ -110,9 +119,16 @@ private:
   type&
   create_type (tree, access, path const& f, size_t l, size_t c);
 
-  string
-  emit_type_name (tree, bool direct = true);
+  void
+  emit_member (cl::FieldDecl const*,
+               scope&,
+               char const* kind,
+               decl_set::const_iterator b,
+               decl_set::const_iterator i,
+               decl_set::const_iterator e);
 
+  string
+  emit_type_name (tree);
 
   //
   // Pragma handling.
@@ -138,32 +154,35 @@ private:
   void
   diagnose_unassoc_pragmas (decl_set const&);
 
-  // Return declaration's fully-qualified scope name (e.g., ::foo::bar).
+  // Return declaration's enclosing non-inline namespaces, outermost first.
   //
-  string
-  fq_scope (tree);
+  static void
+  ns_chain (cl::Decl const*, vector<cl::NamespaceDecl const*>&);
 
   // Return declaration's access.
   //
-  access
-  decl_access (tree decl)
+  static access
+  decl_access (cl::Decl const* d)
   {
-    // Note that TREE_PUBLIC() returns something other than what we need.
-    //
-    if (TREE_PRIVATE (decl))
-      return access::private_;
+    switch (d->getAccess ())
+    {
+    case cl::AS_private:   return access::private_;
+    case cl::AS_protected: return access::protected_;
+    default:               return access::public_;
+    }
+  }
 
-    if (TREE_PROTECTED (decl))
-      return access::protected_;
-
-    return access::public_;
+  static location_t
+  dloc (cl::Decl const* d)
+  {
+    return odbc::make_location (d->getLocation ());
   }
 
   //
   //
   template <typename T>
   void
-  define_fund (tree);
+  define_fund (cl::QualType, char const* name);
 
 private:
   options const& ops_;
@@ -183,6 +202,8 @@ private:
 
   typedef map<location_t, tree> decl_map;
   decl_map all_decls_;
+
+  set<cl::NamespaceDecl const*> namespaces_; // Collected namespaces.
 };
 
 bool parser::impl::tree_decl::
@@ -191,7 +212,7 @@ operator< (tree_decl const& y) const
   location_t xl, yl;
   int xb (0), yb (0);
 
-  if (decl != 0)
+  if (decl)
     xl = real_source_location (decl);
   else if (vdecl != 0)
   {
@@ -201,7 +222,7 @@ operator< (tree_decl const& y) const
   else
     xl = prag->loc;
 
-  if (y.decl != 0)
+  if (y.decl)
     yl = real_source_location (y.decl);
   else if (y.vdecl != 0)
   {
@@ -224,15 +245,115 @@ operator< (tree_decl const& y) const
 }
 
 //
+// Helpers.
+//
+
+namespace
+{
+  // Return true if the declaration comes from the compiler itself (built-
+  // in declarations, predefined macros buffer, etc).
+  //
+  bool
+  builtin_p (cl::Decl const* d)
+  {
+    if (d->isImplicit ())
+      return true;
+
+    cl::SourceLocation l (d->getLocation ());
+
+    if (l.isInvalid ())
+      return true;
+
+    cl::SourceManager& sm (odbc::sm ());
+    l = sm.getExpansionLoc (l);
+
+    return sm.isWrittenInBuiltinFile (l) || sm.isWrittenInCommandLineFile (l);
+  }
+
+  // Return true if this tag declaration is the one that represents the
+  // type (the definition, if any, otherwise the first declaration).
+  //
+  bool
+  primary_tag (cl::TagDecl const* t)
+  {
+    if (t->isImplicit () || cl::isa<cl::ClassTemplateSpecializationDecl> (t))
+      return false;
+
+    if (cl::CXXRecordDecl const* r = cl::dyn_cast<cl::CXXRecordDecl> (t))
+    {
+      if (r->isInjectedClassName () ||
+          r->isLambda () ||
+          r->getDescribedClassTemplate () != 0)
+        return false;
+    }
+
+    if (cl::TagDecl const* def = t->getDefinition ())
+      return def == t;
+
+    return t == t->getCanonicalDecl ();
+  }
+
+  bool
+  primary_template (cl::ClassTemplateDecl const* t)
+  {
+    if (t->isImplicit ())
+      return false;
+
+    cl::CXXRecordDecl const* r (t->getTemplatedDecl ());
+
+    if (cl::CXXRecordDecl const* def = r->getDefinition ())
+      return def == r;
+
+    return t == t->getCanonicalDecl ();
+  }
+
+  inline tree
+  tag_type (cl::TagDecl const* t)
+  {
+    return odbc::make (cl::QualType (odbc::ast ().getCanonicalTagType (t)));
+  }
+
+  inline tree
+  template_key (cl::ClassTemplateDecl const* t)
+  {
+    return odbc::make (t->getCanonicalDecl ());
+  }
+
+  // Return the type with all the qualifiers (including those on array
+  // elements) and sugar removed. Return the qualifiers in quals.
+  //
+  cl::QualType
+  main_variant (cl::QualType t, cl::Qualifiers& quals)
+  {
+    return odbc::ast ().getUnqualifiedArrayType (t.getCanonicalType (), quals);
+  }
+
+  inline cl::QualType
+  main_variant (cl::QualType t)
+  {
+    cl::Qualifiers q;
+    return main_variant (t, q);
+  }
+
+  inline cl::QualType
+  any_type (tree t)
+  {
+    if (t.kind () == tree::type_decl_kind)
+      t = TREE_TYPE (t);
+
+    return odbc::type (t);
+  }
+}
+
+//
 // Function templates.
 //
 
 template <typename T>
 void parser::impl::
-define_fund (tree t)
+define_fund (cl::QualType qt, char const* name)
 {
-  t = TYPE_MAIN_VARIANT (t);
-  char const* name (IDENTIFIER_POINTER (DECL_NAME (TYPE_NAME (t))));
+  tree t (odbc::make (qt.getCanonicalType ()));
 
   T& node (unit_->new_fund_node<T> (t));
   unit_->new_edge<defines> (*scope_, node, name);
@@ -261,8 +382,12 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
     unit_->insert (c, *c_node);
   }
 
-  if (stub || !COMPLETE_TYPE_P (c))
+  cl::CXXRecordDecl const* rd (odbc::record_decl (c));
+
+  if (stub || !COMPLETE_TYPE_P (c) || rd == 0 || !rd->hasDefinition ())
     return *c_node;
+
+  rd = rd->getDefinition ();
 
   // Note: "include" the base classes into the class scope (see comment for
   // self-typedefs in emit_type_decl()).
@@ -271,35 +396,19 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
 
   // Traverse base information.
   //
-  tree bis (TYPE_BINFO (c));
-  size_t n (bis ? BINFO_N_BASE_BINFOS (bis) : 0);
-
-  for (size_t i (0); i < n; i++)
+  for (cl::CXXBaseSpecifier const& bs: rd->bases ())
   {
-    tree bi (BINFO_BASE_BINFO (bis, i));
     access a (access::public_);
 
-    if (BINFO_BASE_ACCESSES (bis))
+    switch (bs.getAccessSpecifier ())
     {
-      tree ac (BINFO_BASE_ACCESS (bis, i));
-
-      if (ac == NULL_TREE || ac == access_public_node)
-      {
-        a = access::public_;
-      }
-      else if (ac == access_protected_node)
-      {
-        a = access::protected_;
-      }
-      else
-      {
-        assert (ac == access_private_node);
-        a = access::private_;
-      }
+    case cl::AS_protected: a = access::protected_; break;
+    case cl::AS_private:   a = access::private_; break;
+    default:               break;
     }
 
-    bool virt (BINFO_VIRTUAL_P (bi));
-    tree base (TYPE_MAIN_VARIANT (BINFO_TYPE (bi)));
+    bool virt (bs.isVirtual ());
+    tree base (odbc::make (main_variant (bs.getType ())));
 
     // Find the corresponding graph node. If we cannot find one then
     // the base is a template instantiation since an ordinary class
@@ -313,7 +422,7 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
       b_node = &dynamic_cast<class_&> (*n);
 
       if (trace)
-        name = IDENTIFIER_POINTER (DECL_NAME (TYPE_NAME (base)));
+        name = DECL_NAME (TYPE_NAME (base));
     }
     else
     {
@@ -338,35 +447,7 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
   // the source code order.
   //
   decl_set decls;
-
-  for (tree d (TYPE_FIELDS (c)); d != NULL_TREE; d = TREE_CHAIN (d))
-  {
-    switch (TREE_CODE (d))
-    {
-    case TYPE_DECL:
-      {
-        if (!DECL_SELF_REFERENCE_P (d))
-          decls.insert (d);
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        if (DECL_CLASS_TEMPLATE_P (d))
-          decls.insert (d);
-        break;
-      }
-    case FIELD_DECL:
-      {
-        if (!DECL_ARTIFICIAL (d))
-          decls.insert (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
-  }
+  collect_members (rd, decls, false);
 
   // Add virtual declarations if any.
   //
@@ -410,9 +491,7 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
           // First check that it doesn't conflict with any of the real
           // data members defined in this class.
           //
-          tree d (
-            lookup_qualified_name (
-              c, get_identifier (vd.name.c_str ()), false, false));
+          tree d (lookup_qualified_name (c, vd.name, false, false));
 
           if (d != error_mark_node && TREE_CODE (d) == FIELD_DECL)
           {
@@ -459,103 +538,23 @@ emit_class (tree c, path const& file, size_t line, size_t clmn, bool stub)
       continue;
     }
 
-    tree d (i->decl);
+    cl::Decl const* d (odbc::decl (i->decl));
 
-    switch (TREE_CODE (d))
+    if (cl::isa<cl::TagDecl> (d) || cl::isa<cl::TypedefNameDecl> (d))
     {
-    case TYPE_DECL:
-      {
-        type* n (emit_type_decl (d));
+      type* n (emit_type_decl (d));
 
-        // If this is a named class-type definition, then handle
-        // the pragmas.
-        //
-        if (n != 0)
-          process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
-
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        emit_template_decl (d);
-        break;
-      }
-    case FIELD_DECL:
-      {
-        // If this is a bit-field then TREE_TYPE may be a modified type
-        // with lesser precision. In this case, DECL_BIT_FIELD_TYPE
-        // will be the type that was original specified. Use that type
-        // for now. Furthermore, bitfields can be anonymous, which we
-        // ignore.
-        //
-        //
-        bool bf (DECL_C_BIT_FIELD (d));
-
-        if (bf && DECL_NAME (d) == 0)
-          break;
-
-        // Another case where we can have NULL name is anonymous struct
-        // or union extension, for example:
-        //
-        // struct s
-        // {
-        //   union
-        //   {
-        //     int a;
-        //     int b;
-        //   };
-        // };
-        //
-        // GCC appears to create a fake member for such a struct/union
-        // without any name. Ignore such members for now.
-        //
-        if (DECL_NAME (d) == 0)
-          break;
-
-        tree t (bf ? DECL_BIT_FIELD_TYPE (d) : TREE_TYPE (d));
-
-        char const* name (IDENTIFIER_POINTER (DECL_NAME (d)));
-
-        path file (DECL_SOURCE_FILE (d));
-        size_t line (DECL_SOURCE_LINE (d));
-        size_t clmn (DECL_SOURCE_COLUMN (d));
-
-        access a (decl_access (d));
-
-        type& type_node (emit_type (t, a, file, line, clmn));
-        data_member& member_node (
-          unit_->new_node<data_member> (file, line, clmn, d));
-        unit_->insert (d, member_node);
-
-        unit_->new_edge<names> (*c_node, member_node, name, a);
-        belongs& edge (unit_->new_edge<belongs> (member_node, type_node));
-
-        // See if there is a name hint for this type.
-        //
-        if (names* hint = unit_->find_hint (t))
-          edge.hint (*hint);
-
-        if (trace)
-        {
-          string type_name (emit_type_name (t));
-
-          ts << "\t" << a.string () << " data member " << type_name
-             << " (" << &type_node << ") " << name << " at "
-             << file << ":" << line << endl;
-        }
-
-        // Process pragmas that may be associated with this field.
-        //
-        process_pragmas (d, member_node, name, b, i, e);
-
-        break;
-      }
-    default:
-      {
-        assert (false);
-        break;
-      }
+      // If this is a named class-type definition, then handle
+      // the pragmas.
+      //
+      if (n != 0)
+        process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
     }
+    else if (cl::ClassTemplateDecl const* t =
+               cl::dyn_cast<cl::ClassTemplateDecl> (d))
+      emit_template_decl (t);
+    else if (cl::FieldDecl const* f = cl::dyn_cast<cl::FieldDecl> (d))
+      emit_member (f, *c_node, "data member", b, i, e);
   }
 
   // Diagnose any position pragmas that haven't been associated.
@@ -588,8 +587,12 @@ emit_union (tree u, path const& file, size_t line, size_t clmn, bool stub)
     unit_->insert (u, *u_node);
   }
 
-  if (stub || !COMPLETE_TYPE_P (u))
+  cl::CXXRecordDecl const* rd (odbc::record_decl (u));
+
+  if (stub || !COMPLETE_TYPE_P (u) || rd == 0 || !rd->hasDefinition ())
     return *u_node;
+
+  rd = rd->getDefinition ();
 
   class_scopes_.push_back (u_node);
 
@@ -597,35 +600,7 @@ emit_union (tree u, path const& file, size_t line, size_t clmn, bool stub)
   // the source code order.
   //
   decl_set decls;
-
-  for (tree d (TYPE_FIELDS (u)); d != NULL_TREE ; d = TREE_CHAIN (d))
-  {
-    switch (TREE_CODE (d))
-    {
-    case TYPE_DECL:
-      {
-        if (!DECL_SELF_REFERENCE_P (d))
-          decls.insert (d);
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        if (DECL_CLASS_TEMPLATE_P (d))
-          decls.insert (d);
-        break;
-      }
-    case FIELD_DECL:
-      {
-        if (!DECL_ARTIFICIAL (d))
-          decls.insert (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
-  }
+  collect_members (rd, decls, false);
 
   // Add location pragmas if any.
   //
@@ -647,90 +622,23 @@ emit_union (tree u, path const& file, size_t line, size_t clmn, bool stub)
     if (i->prag)
       continue;
 
-    tree d (i->decl);
+    cl::Decl const* d (odbc::decl (i->decl));
 
-    switch (TREE_CODE (d))
+    if (cl::isa<cl::TagDecl> (d) || cl::isa<cl::TypedefNameDecl> (d))
     {
-    case TYPE_DECL:
-      {
-        type* n (emit_type_decl (d));
+      type* n (emit_type_decl (d));
 
-        // If this is a named class-type definition, then handle
-        // the pragmas.
-        //
-        if (n != 0)
-          process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
-
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        emit_template_decl (d);
-        break;
-      }
-    case FIELD_DECL:
-      {
-        // We can have NULL name in case of anonymous struct or union
-        // extension, for example:
-        //
-        // union s
-        // {
-        //   struct
-        //   {
-        //     int a;
-        //     int b;
-        //   };
-        //   int c;
-        // };
-        //
-        // GCC appears to create a fake member for such a struct/union
-        // without any name. Ignore such members for now.
-        //
-        if (DECL_NAME (d) == 0)
-          break;
-
-        tree t (TREE_TYPE (d));
-        char const* name (IDENTIFIER_POINTER (DECL_NAME (d)));
-
-        path file (DECL_SOURCE_FILE (d));
-        size_t line (DECL_SOURCE_LINE (d));
-        size_t clmn (DECL_SOURCE_COLUMN (d));
-
-        access a (decl_access (d));
-
-        type& type_node (emit_type (t, a, file, line, clmn));
-        data_member& member_node (
-          unit_->new_node<data_member> (file, line, clmn, d));
-        unit_->insert (d, member_node);
-
-        unit_->new_edge<names> (*u_node, member_node, name, a);
-        belongs& edge (unit_->new_edge<belongs> (member_node, type_node));
-
-        // See if there is a name hint for this type.
-        //
-        if (names* hint = unit_->find_hint (t))
-          edge.hint (*hint);
-
-        if (trace)
-        {
-          string type_name (emit_type_name (t));
-
-          ts << "\t" << a.string () << " union member " << type_name
-             << " (" << &type_node << ") " << name << " at "
-             << file << ":" << line << endl;
-        }
-
-        // Process pragmas that may be associated with this field.
-        //
-        process_pragmas (d, member_node, name, b, i, e);
-
-        break;
-      }
-    default:
-      {
-        break;
-      }
+      // If this is a named class-type definition, then handle
+      // the pragmas.
+      //
+      if (n != 0)
+        process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
     }
+    else if (cl::ClassTemplateDecl const* t =
+               cl::dyn_cast<cl::ClassTemplateDecl> (d))
+      emit_template_decl (t);
+    else if (cl::FieldDecl const* f = cl::dyn_cast<cl::FieldDecl> (d))
+      emit_member (f, *u_node, "union member", b, i, e);
   }
 
   // Diagnose any position pragmas that haven't been associated.
@@ -761,7 +669,7 @@ impl (options const& ops,
 }
 
 unique_ptr<unit> parser::impl::
-parse (tree global_scope, path const& main_file)
+parse (tree, path const& main_file)
 {
   unique_ptr<unit> u (new unit (main_file));
   u->insert (global_namespace, *u);
@@ -771,38 +679,42 @@ parse (tree global_scope, path const& main_file)
   scope_ = unit_;
   error_ = 0;
 
-  // Define fundamental types.
+  // Define fundamental types. Note that we use the GCC names for
+  // compatibility (e.g., database type maps rely on them).
   //
-  define_fund<fund_void> (void_type_node);
-  define_fund<fund_bool> (boolean_type_node);
-  define_fund<fund_char> (char_type_node);
-  define_fund<fund_wchar> (wchar_type_node);
+  cl::ASTContext& c (odbc::ast ());
+
+  define_fund<fund_void> (c.VoidTy, "void");
+  define_fund<fund_bool> (c.BoolTy, "bool");
+  define_fund<fund_char> (c.CharTy, "char");
+  define_fund<fund_wchar> (c.WCharTy, "wchar_t");
 
   if (ops_.std () >= cxx_version::cxx11)
   {
-    define_fund<fund_char16> (char16_type_node);
-    define_fund<fund_char32> (char32_type_node);
+    define_fund<fund_char16> (c.Char16Ty, "char16_t");
+    define_fund<fund_char32> (c.Char32Ty, "char32_t");
   }
 
-  define_fund<fund_signed_char> (signed_char_type_node);
-  define_fund<fund_unsigned_char> (unsigned_char_type_node);
-  define_fund<fund_short> (short_integer_type_node);
-  define_fund<fund_unsigned_short> (short_unsigned_type_node);
-  define_fund<fund_int> (integer_type_node);
-  define_fund<fund_unsigned_int> (unsigned_type_node);
-  define_fund<fund_long> (long_integer_type_node);
-  define_fund<fund_unsigned_long> (long_unsigned_type_node);
-  define_fund<fund_long_long> (long_long_integer_type_node);
-  define_fund<fund_unsigned_long_long> (long_long_unsigned_type_node);
-  define_fund<fund_float> (float_type_node);
-  define_fund<fund_double> (double_type_node);
-  define_fund<fund_long_double> (long_double_type_node);
+  define_fund<fund_signed_char> (c.SignedCharTy, "signed char");
+  define_fund<fund_unsigned_char> (c.UnsignedCharTy, "unsigned char");
+  define_fund<fund_short> (c.ShortTy, "short int");
+  define_fund<fund_unsigned_short> (c.UnsignedShortTy, "short unsigned int");
+  define_fund<fund_int> (c.IntTy, "int");
+  define_fund<fund_unsigned_int> (c.UnsignedIntTy, "unsigned int");
+  define_fund<fund_long> (c.LongTy, "long int");
+  define_fund<fund_unsigned_long> (c.UnsignedLongTy, "long unsigned int");
+  define_fund<fund_long_long> (c.LongLongTy, "long long int");
+  define_fund<fund_unsigned_long_long> (c.UnsignedLongLongTy,
+                                        "long long unsigned int");
+  define_fund<fund_float> (c.FloatTy, "float");
+  define_fund<fund_double> (c.DoubleTy, "double");
+  define_fund<fund_long_double> (c.LongDoubleTy, "long double");
 
   // First collect all the namespace-level declarations we are
   // interested in in the line-decl map so that they appear in
   // the source code order.
   //
-  collect (global_scope);
+  collect (c.getTranslationUnitDecl ());
 
   // Add namespace-level position pragmas if any.
   //
@@ -846,7 +758,7 @@ parse (tree global_scope, path const& main_file)
         break;
       }
 
-      if (scope == global_namespace)
+      if (scope == global_namespace || !scope)
         break;
 
       prev = scope;
@@ -883,93 +795,99 @@ parse (tree global_scope, path const& main_file)
 }
 
 void parser::impl::
-collect (tree ns)
+collect (cl::DeclContext const* dc)
 {
-  cp_binding_level* level = NAMESPACE_LEVEL (ns);
-  tree decl = level->names;
-
-  // Collect declarations.
-  //
-  for (; decl != NULL_TREE; decl = TREE_CHAIN (decl))
+  for (cl::Decl const* d: dc->decls ())
   {
-    all_decls_[real_source_location (decl)] = decl;
-
-    if (DECL_IS_BUILTIN (decl))
-      continue;
-
-    switch (TREE_CODE (decl))
+    // Transparent contexts (extern "C", export).
+    //
+    if (cl::isa<cl::LinkageSpecDecl> (d) || cl::isa<cl::ExportDecl> (d))
     {
-    case TYPE_DECL:
-      {
-        // Skip special type declarations.
-        //
-        if (DECL_NAME (decl) == NULL_TREE)
-          continue;
-
-        tree type (TREE_TYPE (decl));
-        if (LAMBDA_TYPE_P (type))
-          continue;
-
-        decls_.insert (decl);
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        if (DECL_CLASS_TEMPLATE_P (decl))
-          decls_.insert (decl);
-
-        break;
-      }
-    default:
-      {
-        break;
-      }
+      collect (cl::cast<cl::DeclContext> (d));
+      continue;
     }
-  }
 
-  // Traverse namespaces.
-  //
-  for (
-#if BUILDING_GCC_MAJOR >= 8
-    decl = level->names;
-#else
-    decl = level->namespaces;
-#endif
-    decl != NULL_TREE;
-    decl = TREE_CHAIN (decl))
-  {
-#if BUILDING_GCC_MAJOR >= 8
-    // Now namespaces are interleaved with other declarations. In fact, we
-    // could probably collect everything in a single pass.
-    //
-    if (TREE_CODE (decl) != NAMESPACE_DECL)
-      continue;
-#endif
-
-    // Ignore namespace aliases.
-    //
-    if (DECL_NAMESPACE_ALIAS (decl))
-      continue;
-
-    if (!DECL_IS_BUILTIN (decl) || DECL_NAMESPACE_STD_P (decl))
+    if (cl::NamespaceDecl const* ns = cl::dyn_cast<cl::NamespaceDecl> (d))
     {
-      tree dn (DECL_NAME (decl));
-
-      if (trace)
-      {
-        char const* name (dn ? IDENTIFIER_POINTER (dn) : "<anonymous>");
-
-        ts << "namespace " << name << " at "
-           << DECL_SOURCE_FILE (decl) << ":"
-           << DECL_SOURCE_LINE (decl) << endl;
-      }
+      if (d->getLocation ().isValid ())
+        all_decls_[dloc (d)] = odbc::make (d);
 
       // Skip anonymous namespaces (there could be nothing of interest to us
       // inside but they wreck havoc with our attempts to sort declarations
       // into namespaces).
       //
-      if (dn != 0)
-        collect (decl);
+      if (ns->isAnonymousNamespace ())
+        continue;
+
+      ns = ns->getCanonicalDecl ();
+
+      if (!namespaces_.insert (ns).second)
+        continue; // Already collected (re-opened namespace).
+
+      if (trace)
+        ts << "namespace " << ns->getName ().str () << " at "
+           << DECL_SOURCE_FILE (odbc::make (ns)) << ":"
+           << DECL_SOURCE_LINE (odbc::make (ns)) << endl;
+
+      for (cl::NamespaceDecl const* r: ns->redecls ())
+        collect (r);
+
+      continue;
+    }
+
+    if (builtin_p (d))
+      continue;
+
+    if (cl::isa<cl::NamedDecl> (d))
+      all_decls_[dloc (d)] = odbc::make (d);
+
+    if (cl::TagDecl const* t = cl::dyn_cast<cl::TagDecl> (d))
+    {
+      if (primary_tag (t))
+        decls_.insert (odbc::make (t));
+    }
+    else if (cl::isa<cl::TypedefNameDecl> (d))
+      decls_.insert (odbc::make (d));
+    else if (cl::ClassTemplateDecl const* t =
+               cl::dyn_cast<cl::ClassTemplateDecl> (d))
+    {
+      if (primary_template (t))
+        decls_.insert (odbc::make (t));
+    }
+  }
+}
+
+void parser::impl::
+collect_members (cl::CXXRecordDecl const* rd,
+                 decl_set& decls,
+                 bool templates_only)
+{
+  for (cl::Decl const* d: rd->decls ())
+  {
+    if (cl::ClassTemplateDecl const* t =
+          cl::dyn_cast<cl::ClassTemplateDecl> (d))
+    {
+      if (primary_template (t))
+        decls.insert (odbc::make (t));
+    }
+
+    if (templates_only)
+      continue;
+
+    if (cl::TagDecl const* t = cl::dyn_cast<cl::TagDecl> (d))
+    {
+      if (primary_tag (t))
+        decls.insert (odbc::make (t));
+    }
+    else if (cl::isa<cl::TypedefNameDecl> (d))
+    {
+      if (!d->isImplicit ())
+        decls.insert (odbc::make (d));
+    }
+    else if (cl::isa<cl::FieldDecl> (d))
+    {
+      if (!d->isImplicit ())
+        decls.insert (odbc::make (d));
     }
   }
 }
@@ -985,13 +903,19 @@ emit ()
     if (i->prag)
       continue;
 
-    tree decl (i->decl);
+    cl::Decl const* decl (odbc::decl (i->decl));
 
     // Get this declaration's namespace and unwind our scope until
     // we find a common prefix of namespaces.
     //
+    vector<cl::NamespaceDecl const*> chain;
+    ns_chain (decl, chain);
+
+    string ns;
+    for (cl::NamespaceDecl const* n: chain)
+      ns += "::" + n->getName ().str ();
+
     string pfx;
-    string ns (fq_scope (decl));
 
     for (pfx = scope_->fq_name (); !pfx.empty (); pfx = scope_->fq_name ())
     {
@@ -999,7 +923,7 @@ emit ()
 
       // Make sure we handle cases like ns="::foobar", pfx="::foo".
       //
-      if (ns.compare (0, n, pfx) == 0 && (ns.size () == n || ns[n - 1] == ':'))
+      if (ns.compare (0, n, pfx) == 0 && (ns.size () == n || ns[n] == ':'))
         break;
 
       if (trace)
@@ -1012,33 +936,30 @@ emit ()
     //
     if (ns != pfx)
     {
-      path f (DECL_SOURCE_FILE (decl));
-      size_t l (DECL_SOURCE_LINE (decl));
-      size_t c (DECL_SOURCE_COLUMN (decl));
+      location_t dl (dloc (decl));
+      path f (LOCATION_FILE (dl));
+      size_t l (LOCATION_LINE (dl));
+      size_t c (LOCATION_COLUMN (dl));
 
-      for (size_t b (pfx.size () + 2), e (ns.find ("::", b));
-           b != string::npos;)
+      // Number of namespaces already open.
+      //
+      size_t k (0);
+      for (size_t p (pfx.find ("::")); p != string::npos;
+           p = pfx.find ("::", p + 2))
+        ++k;
+
+      for (; k < chain.size (); ++k)
       {
-        string n (ns, b, e == string::npos ? e : e - b);
+        string n (chain[k]->getName ().str ());
 
         if (trace)
-          ts << "opening namespace " << n << " for "
-             << DECL_SOURCE_FILE (decl) << ":"
-             << DECL_SOURCE_LINE (decl) << endl;
+          ts << "opening namespace " << n << " for " << f << ":" << l
+             << endl;
 
         // Use the declarations's file, line, and column as an
-        // approximation for this namespace origin. Also resolve
-        // the tree node for this namespace.
+        // approximation for this namespace origin.
         //
-#if BUILDING_GCC_MAJOR >= 8
-        tree tree_node (
-          get_namespace_binding (
-            scope_->tree_node (), get_identifier (n.c_str ())));
-#else
-        tree tree_node (
-          namespace_binding (
-            get_identifier (n.c_str ()), scope_->tree_node ()));
-#endif
+        tree tree_node (odbc::make (chain[k]));
 
         namespace_& node (unit_->new_node<namespace_> (f, l, c, tree_node));
         unit_->new_edge<defines> (*scope_, node, n);
@@ -1061,40 +982,21 @@ emit ()
         }
 
         scope_ = &node;
-
-        if (e == string::npos)
-          b = e;
-        else
-        {
-          b = e + 2;
-          e = ns.find ("::", b);
-        }
       }
     }
 
-    switch (TREE_CODE (decl))
+    if (cl::ClassTemplateDecl const* t =
+          cl::dyn_cast<cl::ClassTemplateDecl> (decl))
+      emit_template_decl (t);
+    else
     {
-    case TYPE_DECL:
-      {
-        type* n (emit_type_decl (decl));
+      type* n (emit_type_decl (decl));
 
-        // If this is a named class-type definition, then handle
-        // the pragmas.
-        //
-        if (n != 0)
-          process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
-
-        break;
-      }
-    case TEMPLATE_DECL:
-      {
-        emit_template_decl (decl);
-        break;
-      }
-    default:
-      {
-        break;
-      }
+      // If this is a named class-type definition, then handle
+      // the pragmas.
+      //
+      if (n != 0)
+        process_pragmas (n->tree_node (), *n, n->name (), b, i, e);
     }
 
     assert (class_scopes_.empty ());
@@ -1106,97 +1008,73 @@ emit ()
 }
 
 type* parser::impl::
-emit_type_decl (tree decl)
+emit_type_decl (cl::Decl const* decl)
 {
-  tree t (TREE_TYPE (decl));
-  gcc_tree_code_type tc (TREE_CODE (t));
-
-  tree decl_name (DECL_NAME (decl));
-  char const* name (IDENTIFIER_POINTER (decl_name));
-
-  if (DECL_ARTIFICIAL (decl) &&
-      (tc == RECORD_TYPE || tc == UNION_TYPE || tc == ENUMERAL_TYPE))
+  if (cl::TagDecl const* td = cl::dyn_cast<cl::TagDecl> (decl))
   {
-    // If we have an anonymous class typedef, use the user-
-    // supplied name instead of the synthesized one. ARM
-    // says that in typedef struct {} S; S becomes struct's
-    // name.
-    //
-    if (IDENTIFIER_ANON_P (decl_name))
-    {
-      tree d (TYPE_NAME (t));
+    string name (td->getName ().str ());
+    cl::Decl const* ld (td); // Declaration for location.
 
-      if (d != NULL_TREE &&
-          !DECL_ARTIFICIAL (d) &&
-          DECL_NAME (d) != NULL_TREE &&
-          !IDENTIFIER_ANON_P (DECL_NAME (d)))
+    if (name.empty ())
+    {
+      // If we have an anonymous class typedef, use the user-supplied
+      // name instead. ARM says that in typedef struct {} S; S becomes
+      // struct's name.
+      //
+      if (cl::TypedefNameDecl const* tn = td->getTypedefNameForAnonDecl ())
       {
-        decl = d;
-        decl_name = DECL_NAME (decl);
-        name = IDENTIFIER_POINTER (decl_name);
+        name = tn->getName ().str ();
+        ld = tn;
       }
       else
       {
-        // This type has only the synthesized name which means that
-        // it is either typedef'ed as a derived type or it is used
-        // to declare a varibale or similar. The first case will be
-        // covered by the typedef handling code below. The second
-        // case will be covere by emit_type().
+        // This type has no name which means that it is either typedef'ed
+        // as a derived type or it is used to declare a varibale or
+        // similar. The first case will be covered by the typedef handling
+        // code below. The second case will be covere by emit_type().
         //
         return 0;
       }
     }
 
-    path file (DECL_SOURCE_FILE (decl));
-    size_t line (DECL_SOURCE_LINE (decl));
-    size_t clmn (DECL_SOURCE_COLUMN (decl));
+    location_t dl (dloc (ld));
+    path file (LOCATION_FILE (dl));
+    size_t line (LOCATION_LINE (dl));
+    size_t clmn (LOCATION_COLUMN (dl));
+
+    tree t (tag_type (td));
+    gcc_tree_code_type tc (TREE_CODE (t));
+
+    if (trace)
+      ts << "start " << gcc_tree_code_name (tc) << " " << name
+         << " at " << file << ":" << line << endl;
 
     type* node (0);
 
-    // Pointers to member functions are represented as record
-    // types. Detect and handle this case.
-    //
-    if (TYPE_PTRMEMFUNC_P (t))
+    switch (tc)
     {
-      t = TYPE_MAIN_VARIANT (t);
-      node = &unit_->new_node<unsupported_type> (
-        file, line, clmn, t, "pointer_to_member_function_type");
-      unit_->insert (t, *node);
-    }
-    else
-    {
-
-      if (trace)
-        ts << "start " <<  gcc_tree_code_name(tc) << " " << name
-           << " at " << file << ":" << line << endl;
-
-      switch (tc)
+    case RECORD_TYPE:
       {
-      case RECORD_TYPE:
-        {
-          node = &emit_class<class_> (t, file, line, clmn);
-          break;
-        }
-      case UNION_TYPE:
-        {
-          node = &emit_union<union_> (t, file, line, clmn);
-          break;
-        }
-      case ENUMERAL_TYPE:
-        {
-          node = &emit_enum (t, decl_access (decl), file, line, clmn);
-          break;
-        }
-      default:
+        node = &emit_class<class_> (t, file, line, clmn);
         break;
       }
-
-      if (trace)
-        ts << "end " <<  gcc_tree_code_name(tc) << " " << name
-           << " (" << node << ") at "
-           << DECL_SOURCE_FILE (decl) << ":"
-           << DECL_SOURCE_LINE (decl) << endl;
+    case UNION_TYPE:
+      {
+        node = &emit_union<union_> (t, file, line, clmn);
+        break;
+      }
+    case ENUMERAL_TYPE:
+      {
+        node = &emit_enum (t, decl_access (td), file, line, clmn);
+        break;
+      }
+    default:
+      return 0;
     }
+
+    if (trace)
+      ts << "end " << gcc_tree_code_name (tc) << " " << name
+         << " (" << node << ") at " << file << ":" << line << endl;
 
     if (COMPLETE_TYPE_P (t))
       unit_->new_edge<defines> (*scope_, *node, name);
@@ -1205,197 +1083,169 @@ emit_type_decl (tree decl)
 
     return node;
   }
-  else
+
+  // Normal typedef.
+  //
+  cl::TypedefNameDecl const* td (cl::cast<cl::TypedefNameDecl> (decl));
+  tree dt (odbc::make (td));
+  tree t (TREE_TYPE (dt));
+  string name (td->getName ().str ());
+
+  // We need to detect and ignore the anonymous class typedef case
+  // described above since we already used this name to define the
+  // class.
+  //
   {
-    // Normal typedef. We need to detect and ignore the anonymous
-    // class typedef case described above since we already used
-    // this name to define the class.
-    //
-    if ((tc == RECORD_TYPE || tc == UNION_TYPE || tc == ENUMERAL_TYPE) &&
-        TYPE_NAME (TYPE_MAIN_VARIANT (t)) == decl)
-      return 0;
+    cl::QualType ut (td->getUnderlyingType ());
 
-    path f (DECL_SOURCE_FILE (decl));
-    size_t l (DECL_SOURCE_LINE (decl));
-    size_t c (DECL_SOURCE_COLUMN (decl));
-
-    type& node (emit_type (t, decl_access (decl), f, l, c));
-
-    // Omit inner self-typedefs (e.g., a class typedefs itself in its own
-    // scope). Such aliases don't buy us anything (in particular, they cannot
-    // be used to form an fq-name) but they do cause scoping cycles if this
-    // name happens to be used to find outer scope (see scope::scope_()).
-    // Note that this means we can now have class template instantiations that
-    // are not named and therefore don't belong to any scope.
-    //
-    // Note that emit_type() might still enter this decl as a hint. It's fuzzy
-    // whether this is harmless or not.
-    //
-    // Note also that using the normal scope hierarchy does not work in more
-    // complex cases where templates cross-self-typedef. So instead we now use
-    // a special-purpose mechanism (class_scopes_). Note for this to work
-    // correctly (hopefully), the class should be "in scope" for its bases.
-    // Here is a representative examples (inspired by code in Eigen):
-    //
-    // template <typename M>
-    // struct PlainObjectBase
-    // {
-    //   typedef M Self;
-    // };
-    //
-    // template <typename T, int X, int Y>
-    // struct Matrix: PlainObjectBase<Matrix<T, X, Y>>
-    // {
-    //   typedef PlainObjectBase<Matrix> Base;
-    //   typedef Matrix Self;
-    // };
-    //
-    // typedef Matrix<double, 3, 1> Vector3d;
-    //
-    // Here we want both Self's (but not Base) to be skipped.
-    //
-    if (scope* s = dynamic_cast<scope*> (&node))
+    if (cl::TagDecl const* tag = ut.getCanonicalType ()->getAsTagDecl ())
     {
-      for (auto i (class_scopes_.rbegin ()); i != class_scopes_.rend (); ++i)
-      {
-        if (s == *i)
-        {
-          if (trace)
-          {
-            string s (emit_type_name (t, false));
+      if (tag->getTypedefNameForAnonDecl () == td)
+        return 0;
+    }
+  }
 
-            ts << "omitting inner self-typedef " << s << " (" << &node
-               << ") -> " << name << " at " << f << ":" << l << endl;
-          }
-          return 0;
-        }
+  location_t dl (dloc (td));
+  path f (LOCATION_FILE (dl));
+  size_t l (LOCATION_LINE (dl));
+  size_t c (LOCATION_COLUMN (dl));
+
+  type& node (emit_type (t, decl_access (td), f, l, c));
+
+  // Omit inner self-typedefs (e.g., a class typedefs itself in its own
+  // scope). Such aliases don't buy us anything (in particular, they cannot
+  // be used to form an fq-name) but they do cause scoping cycles if this
+  // name happens to be used to find outer scope (see scope::scope_()).
+  // Note that this means we can now have class template instantiations that
+  // are not named and therefore don't belong to any scope.
+  //
+  // Note that emit_type() might still enter this decl as a hint. It's fuzzy
+  // whether this is harmless or not.
+  //
+  // Note also that using the normal scope hierarchy does not work in more
+  // complex cases where templates cross-self-typedef. So instead we use
+  // a special-purpose mechanism (class_scopes_). Note for this to work
+  // correctly (hopefully), the class should be "in scope" for its bases.
+  // Here is a representative examples (inspired by code in Eigen):
+  //
+  // template <typename M>
+  // struct PlainObjectBase
+  // {
+  //   typedef M Self;
+  // };
+  //
+  // template <typename T, int X, int Y>
+  // struct Matrix: PlainObjectBase<Matrix<T, X, Y>>
+  // {
+  //   typedef PlainObjectBase<Matrix> Base;
+  //   typedef Matrix Self;
+  // };
+  //
+  // typedef Matrix<double, 3, 1> Vector3d;
+  //
+  // Here we want both Self's (but not Base) to be skipped.
+  //
+  if (scope* s = dynamic_cast<scope*> (&node))
+  {
+    for (auto i (class_scopes_.rbegin ()); i != class_scopes_.rend (); ++i)
+    {
+      if (s == *i)
+      {
+        if (trace)
+          ts << "omitting inner self-typedef " << emit_type_name (t)
+             << " (" << &node << ") -> " << name << " at " << f << ":" << l
+             << endl;
+        return 0;
       }
     }
-
-    typedefs& edge (unit_->new_edge<typedefs> (*scope_, node, name));
-
-    // Find our hint.
-    //
-    if (tree ot = DECL_ORIGINAL_TYPE (decl))
-    {
-      if (names* hint = unit_->find_hint (ot))
-        edge.hint (*hint);
-    }
-
-    // Add this edge to the hint map. It may already be there if we
-    // are handling something like this:
-    //
-    // typedef foo bar;
-    // typedef bar foo;
-    //
-    // GCC also appears to re-purpose a node for another name (not
-    // sure if its a bug or a feature), so use the latest seen name.
-    //
-    unit_->insert_hint (t, edge);
-
-    if (trace)
-    {
-      string s (emit_type_name (t, false));
-
-      ts << "typedef " << s << " (" << &node << ") -> " << name
-         << " at " << f << ":" << l << endl;
-    }
-
-    return 0;
   }
+
+  typedefs& edge (unit_->new_edge<typedefs> (*scope_, node, name));
+
+  // Find our hint.
+  //
+  if (tree ot = DECL_ORIGINAL_TYPE (dt))
+  {
+    if (names* hint = unit_->find_hint (ot))
+      edge.hint (*hint);
+  }
+
+  // Add this edge to the hint map. It may already be there if we
+  // are handling something like this:
+  //
+  // typedef foo bar;
+  // typedef bar foo;
+  //
+  // So use the latest seen name.
+  //
+  unit_->insert_hint (t, edge);
+
+  if (trace)
+    ts << "typedef " << emit_type_name (t) << " (" << &node << ") -> "
+       << name << " at " << f << ":" << l << endl;
+
+  return 0;
 }
 
 void parser::impl::
-emit_template_decl (tree decl)
+emit_template_decl (cl::ClassTemplateDecl const* decl)
 {
   // Currently we only handle class/union templates.
   //
-  tree t (TREE_TYPE (DECL_TEMPLATE_RESULT (decl)));
-  gcc_tree_code_type tc (TREE_CODE (t));
+  cl::CXXRecordDecl const* r (decl->getTemplatedDecl ());
+  string name (decl->getName ().str ());
+
+  location_t dl (dloc (decl));
 
   if (trace)
-  {
-    ts << gcc_tree_code_name(tc) << " template (" << decl << ") "
-       << IDENTIFIER_POINTER (DECL_NAME (decl)) << " (" << t << ") at "
-       << DECL_SOURCE_FILE (decl) << ":"
-       << DECL_SOURCE_LINE (decl) << endl;
-
-    ts << "specializations:" << endl;
-
-    for (tree s (DECL_TEMPLATE_SPECIALIZATIONS (decl));
-         s != NULL_TREE; s = TREE_CHAIN (s))
-    {
-      tree t (TREE_TYPE (s));
-      tree d (TYPE_NAME (t));
-
-      ts << "\tspecialization " << t << " at "
-         << DECL_SOURCE_FILE (d) << ":"
-         << DECL_SOURCE_LINE (d) << endl;
-    }
-
-    ts << "instantiations:" << endl;
-
-    for (tree i (DECL_TEMPLATE_INSTANTIATIONS (decl));
-         i != NULL_TREE; i = TREE_CHAIN (i))
-    {
-      tree t (TREE_VALUE (i));
-      tree d (TYPE_NAME (t));
-
-      ts << "\tinstantiation " << t << " at "
-         << DECL_SOURCE_FILE (d) << ":"
-         << DECL_SOURCE_LINE (d) << endl;
-    }
-  }
-
-  char const* name (IDENTIFIER_POINTER (DECL_NAME (decl)));
-
-  if (trace)
-    ts << "start " <<  gcc_tree_code_name(tc) << " template " << name << " at "
-       << DECL_SOURCE_FILE (decl) << ":"
-       << DECL_SOURCE_LINE (decl) << endl;
+    ts << "start " << (r->isUnion () ? "union" : "class") << " template "
+       << name << " at " << LOCATION_FILE (dl) << ":" << LOCATION_LINE (dl)
+       << endl;
 
   type_template* t_node (0);
 
-  if (tc == RECORD_TYPE)
-    t_node = &emit_class_template (decl);
-  else
+  if (r->isUnion ())
     t_node = &emit_union_template (decl);
+  else
+    t_node = &emit_class_template (decl);
 
-  if (COMPLETE_TYPE_P (t))
+  if (r->getDefinition () != 0)
     unit_->new_edge<defines> (*scope_, *t_node, name);
   else
     unit_->new_edge<declares> (*scope_, *t_node, name);
 
   if (trace)
-    ts << "end " <<  gcc_tree_code_name(tc) << " template " << name
-       << " (" << t_node << ") at "
-       << DECL_SOURCE_FILE (decl) << ":"
-       << DECL_SOURCE_LINE (decl) << endl;
+    ts << "end " << (r->isUnion () ? "union" : "class") << " template "
+       << name << " (" << t_node << ") at " << LOCATION_FILE (dl) << ":"
+       << LOCATION_LINE (dl) << endl;
 }
 
 class_template& parser::impl::
-emit_class_template (tree t, bool stub)
+emit_class_template (cl::ClassTemplateDecl const* t, bool stub)
 {
   // See if there is a stub already for this template.
   //
   class_template* ct_node (0);
-  tree c (TREE_TYPE (DECL_TEMPLATE_RESULT (t)));
+  tree k (template_key (t));
 
-  if (node* n = unit_->find (t))
+  if (node* n = unit_->find (k))
   {
     ct_node = &dynamic_cast<class_template&> (*n);
   }
   else
   {
-    path f (DECL_SOURCE_FILE (t));
-    size_t ln (DECL_SOURCE_LINE (t));
-    size_t cl (DECL_SOURCE_COLUMN (t));
+    location_t dl (dloc (t));
+    path f (LOCATION_FILE (dl));
+    size_t ln (LOCATION_LINE (dl));
+    size_t cl (LOCATION_COLUMN (dl));
 
-    ct_node = &unit_->new_node<class_template> (f, ln, cl, c);
-    unit_->insert (t, *ct_node);
+    ct_node = &unit_->new_node<class_template> (f, ln, cl, k);
+    unit_->insert (k, *ct_node);
   }
 
-  if (stub || !COMPLETE_TYPE_P (c))
+  cl::CXXRecordDecl const* def (t->getTemplatedDecl ()->getDefinition ());
+
+  if (stub || def == 0)
     return *ct_node;
 
   class_scopes_.push_back (ct_node);
@@ -1405,23 +1255,7 @@ emit_class_template (tree t, bool stub)
   // nested class template declarations.
   //
   decl_set decls;
-
-  for (tree d (TYPE_FIELDS (c)); d != NULL_TREE ; d = TREE_CHAIN (d))
-  {
-    switch (TREE_CODE (d))
-    {
-    case TEMPLATE_DECL:
-      {
-        if (DECL_CLASS_TEMPLATE_P (d))
-          decls.insert (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
-  }
+  collect_members (def, decls, true);
 
   scope* prev_scope (scope_);
   scope_ = ct_node;
@@ -1429,25 +1263,12 @@ emit_class_template (tree t, bool stub)
   for (decl_set::const_iterator i (decls.begin ()), e (decls.end ());
        i != e; ++i)
   {
-    // Skip pragmas.
-    //
     if (i->prag)
       continue;
 
-    tree d (i->decl);
-
-    switch (TREE_CODE (d))
-    {
-    case TEMPLATE_DECL:
-      {
-        emit_template_decl (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
+    if (cl::ClassTemplateDecl const* d =
+          cl::dyn_cast<cl::ClassTemplateDecl> (odbc::decl (i->decl)))
+      emit_template_decl (d);
   }
 
   // Diagnose any position pragmas that haven't been associated.
@@ -1460,54 +1281,37 @@ emit_class_template (tree t, bool stub)
 }
 
 union_template& parser::impl::
-emit_union_template (tree t, bool stub)
+emit_union_template (cl::ClassTemplateDecl const* t, bool stub)
 {
   // See if there is a stub already for this template.
   //
   union_template* ut_node (0);
-  tree u (TREE_TYPE (DECL_TEMPLATE_RESULT (t)));
+  tree k (template_key (t));
 
-  if (node* n = unit_->find (t))
+  if (node* n = unit_->find (k))
   {
     ut_node = &dynamic_cast<union_template&> (*n);
   }
   else
   {
-    path f (DECL_SOURCE_FILE (t));
-    size_t l (DECL_SOURCE_LINE (t));
-    size_t c (DECL_SOURCE_COLUMN (t));
+    location_t dl (dloc (t));
+    path f (LOCATION_FILE (dl));
+    size_t l (LOCATION_LINE (dl));
+    size_t c (LOCATION_COLUMN (dl));
 
-    ut_node = &unit_->new_node<union_template> (f, l, c, u);
-    unit_->insert (t, *ut_node);
+    ut_node = &unit_->new_node<union_template> (f, l, c, k);
+    unit_->insert (k, *ut_node);
   }
 
-  if (stub || !COMPLETE_TYPE_P (u))
+  cl::CXXRecordDecl const* def (t->getTemplatedDecl ()->getDefinition ());
+
+  if (stub || def == 0)
     return *ut_node;
 
   class_scopes_.push_back (ut_node);
 
-  // Collect member declarations so that we can traverse them in
-  // the source code order. For now we are only interested in
-  // nested class template declarations.
-  //
   decl_set decls;
-
-  for (tree d (TYPE_FIELDS (u)); d != NULL_TREE ; d = TREE_CHAIN (d))
-  {
-    switch (TREE_CODE (d))
-    {
-    case TEMPLATE_DECL:
-      {
-        if (DECL_CLASS_TEMPLATE_P (d))
-          decls.insert (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
-  }
+  collect_members (def, decls, true);
 
   scope* prev_scope (scope_);
   scope_ = ut_node;
@@ -1515,25 +1319,12 @@ emit_union_template (tree t, bool stub)
   for (decl_set::const_iterator i (decls.begin ()), e (decls.end ());
        i != e; ++i)
   {
-    // Skip pragmas.
-    //
     if (i->prag)
       continue;
 
-    tree d (i->decl);
-
-    switch (TREE_CODE (d))
-    {
-    case TEMPLATE_DECL:
-      {
-        emit_template_decl (d);
-        break;
-      }
-    default:
-      {
-        break;
-      }
-    }
+    if (cl::ClassTemplateDecl const* d =
+          cl::dyn_cast<cl::ClassTemplateDecl> (odbc::decl (i->decl)))
+      emit_template_decl (d);
   }
 
   // Diagnose any position pragmas that haven't been associated.
@@ -1555,6 +1346,9 @@ emit_enum (tree e,
 {
   e = TYPE_MAIN_VARIANT (e);
 
+  cl::EnumDecl const* ed (
+    cl::cast<cl::EnumDecl> (odbc::type (e)->getAsTagDecl ()));
+
   // See if there is a stub already for this type.
   //
   enum_* e_node (0);
@@ -1567,46 +1361,50 @@ emit_enum (tree e,
 
     // Set the underlying type even for incomplete (forward-declared) enums.
     //
-    tree ut (ENUM_UNDERLYING_TYPE (e));
-    names* hint (unit_->find_hint (ut));
+    cl::QualType ut (ed->getIntegerType ());
+
+    if (ut.isNull ())
+      ut = odbc::ast ().IntTy;
+
+    names* hint (unit_->find_hint (odbc::make (ut)));
     integral_type* un = dynamic_cast<integral_type*> (
-      unit_->find (TYPE_MAIN_VARIANT (ut)));
+      unit_->find (odbc::make (main_variant (ut))));
 
-    // For "old" enums GCC creates a distinct type node and the only way to
-    // get to one of the known integrals is via its name.
-    //
-    if (un == 0)
+    if (un != 0)
     {
-      ut =  TREE_TYPE (TYPE_NAME (ut));
-      un = dynamic_cast<integral_type*> (unit_->find (TYPE_MAIN_VARIANT (ut)));
+      underlies& edge (unit_->new_edge<underlies> (*un, *e_node));
+
+      if (hint != 0)
+        edge.hint (*hint);
     }
-
-    underlies& edge (unit_->new_edge<underlies> (*un, *e_node));
-
-    if (hint != 0)
-      edge.hint (*hint);
 
     unit_->insert (e, *e_node);
   }
 
-  if (stub || !COMPLETE_TYPE_P (e))
+  cl::EnumDecl const* def (ed->getDefinition ());
+
+  if (stub || !COMPLETE_TYPE_P (e) || def == 0)
     return *e_node;
 
   // Traverse enumerators.
   //
-  for (tree er (TYPE_VALUES (e)); er != NULL_TREE ; er = TREE_CHAIN (er))
+  for (cl::EnumConstantDecl const* ec: def->enumerators ())
   {
-    char const* name (IDENTIFIER_POINTER (TREE_PURPOSE (er)));
-    tree decl (TREE_VALUE (er));
-    tree tval (DECL_INITIAL (decl));
+    string name (ec->getName ().str ());
+    tree decl (odbc::make (ec));
 
-    unsigned long long val (integer_value (tval));
+    llvm::APSInt const& v (ec->getInitVal ());
+    unsigned long long val (
+      v.isSigned ()
+      ? static_cast<unsigned long long> (v.getExtValue ())
+      : v.getZExtValue ());
 
-    // There doesn't seem to be a way to get the proper position for
-    // each enumerator.
-    //
-    enumerator& er_node = unit_->new_node<enumerator> (
-      file, line, clmn, er, val);
+    location_t dl (dloc (ec));
+    path f (LOCATION_FILE (dl));
+    size_t l (LOCATION_LINE (dl));
+    size_t c (LOCATION_COLUMN (dl));
+
+    enumerator& er_node = unit_->new_node<enumerator> (f, l, c, decl, val);
     unit_->new_edge<enumerates> (*e_node, er_node);
     unit_->insert (decl, er_node);
 
@@ -1619,14 +1417,74 @@ emit_enum (tree e,
     // Inject enumerators into the outer scope unless this is an
     // enum class.
     //
-    if (UNSCOPED_ENUM_P (e))
+    if (!def->isScoped ())
       unit_->new_edge<names> (*scope_, er_node, name, access);
 
     if (trace)
-      ts << "\tenumerator " << name << " at " << file << ":" << line << endl;
+      ts << "\tenumerator " << name << " at " << f << ":" << l << endl;
   }
 
   return *e_node;
+}
+
+void parser::impl::
+emit_member (cl::FieldDecl const* d,
+             scope& s,
+             char const* kind,
+             decl_set::const_iterator b,
+             decl_set::const_iterator i,
+             decl_set::const_iterator e)
+{
+  // Bit-fields can be anonymous, which we ignore. Another case where we
+  // can have no name is anonymous struct or union extension, for
+  // example:
+  //
+  // struct s
+  // {
+  //   union
+  //   {
+  //     int a;
+  //     int b;
+  //   };
+  // };
+  //
+  // Ignore such members for now.
+  //
+  if (d->getName ().empty ())
+    return;
+
+  tree dt (odbc::make (d));
+  tree t (odbc::make (d->getType ()));
+  string name (d->getName ().str ());
+
+  location_t dl (dloc (d));
+  path file (LOCATION_FILE (dl));
+  size_t line (LOCATION_LINE (dl));
+  size_t clmn (LOCATION_COLUMN (dl));
+
+  access a (decl_access (d));
+
+  type& type_node (emit_type (t, a, file, line, clmn));
+  data_member& member_node (
+    unit_->new_node<data_member> (file, line, clmn, dt));
+  unit_->insert (dt, member_node);
+
+  unit_->new_edge<names> (s, member_node, name, a);
+  belongs& edge (unit_->new_edge<belongs> (member_node, type_node));
+
+  // See if there is a name hint for this type.
+  //
+  if (names* hint = unit_->find_hint (t))
+    edge.hint (*hint);
+
+  if (trace)
+    ts << "\t" << a.string () << " " << kind << " " << emit_type_name (t)
+       << " (" << &type_node << ") " << name << " at "
+       << file << ":" << line << endl;
+
+  // Process pragmas that may be associated with this field.
+  //
+  process_pragmas (dt, member_node, name, b, i, e);
 }
 
 type& parser::impl::
@@ -1636,16 +1494,12 @@ emit_type (tree t,
            size_t line,
            size_t clmn)
 {
-  tree mv (TYPE_MAIN_VARIANT (t));
+  if (t.kind () == tree::type_decl_kind)
+    t = TREE_TYPE (t);
 
-  if (trace)
-  {
-    ts << gcc_tree_code_name(TREE_CODE (t)) << " " << t
-       << " main " << mv << endl;
-
-    for (tree v (TYPE_MAIN_VARIANT (t)); v != 0; v = TYPE_NEXT_VARIANT (v))
-      ts << "\tvariant " << v << " " << CP_TYPE_CONST_P (v) << endl;
-  }
+  cl::QualType qt (odbc::type (t));
+  cl::Qualifiers quals;
+  tree mv (odbc::make (main_variant (qt, quals)));
 
   node* n (unit_->find (mv));
 
@@ -1654,9 +1508,13 @@ emit_type (tree t,
            : create_type (t, access, file, line, clmn));
 
   if (trace && n != 0)
-    ts << "found node " << &r << " for type " << mv << endl;
+    ts << "found node " << &r << " for type " << emit_type_name (mv) << endl;
 
-  if (cp_type_quals (t) == TYPE_UNQUALIFIED)
+  bool qc (quals.hasConst ());
+  bool qv (quals.hasVolatile ());
+  bool qr (quals.hasRestrict ());
+
+  if (!qc && !qv && !qr)
   {
     unit_->insert (t, r); // Add this variant to the map.
     return r;
@@ -1664,10 +1522,6 @@ emit_type (tree t,
 
   // See if this type already has this variant.
   //
-  bool qc (CP_TYPE_CONST_P (t));
-  bool qv (CP_TYPE_VOLATILE_P (t));
-  bool qr (CP_TYPE_RESTRICT_P (t));
-
   for (type::qualified_iterator i (r.qualified_begin ());
        i != r.qualified_end (); ++i)
   {
@@ -1683,71 +1537,47 @@ emit_type (tree t,
     }
   }
 
-  // No such variant yet. Create a new one. Qualified types are not
-  // unique in the tree so don't add this node to the map.
+  // No such variant yet. Create a new one.
   //
   qualifier& q (unit_->new_node<qualifier> (file, line, clmn, t, qc, qv, qr));
   qualifies& e (unit_->new_edge<qualifies> (q, r));
   unit_->insert (t, q);
 
-  // See if there is a name hint for this type.
-  //
-  // If TREE_TYPE (TYPE_NAME (t)) != t then we have an inline qualifier,
-  // as in:
+  // See if there is a name hint for the base type. We have two possible
+  // cases: an inline qualifier, as in:
   //
   // const foo x;
   //
-  // If they are equal, then there are two possible cases. The first is
-  // when we have a qualifier typedef, as in:
+  // And a qualifier typedef:
   //
   // typedef const foo cfoo;
   // cfoo x;
   //
-  // The second is when we have a qualifier typedef but what is actually
-  // used in the declaration is an inline qualifier, as in:
+  // In the latter case we desugar the typedef until we get to the
+  // qualified type.
   //
-  // typedef const foo cfoo;
-  // const foo x;
-  //
-  // Unfortunately, in GCC, these two cases are indistinguishable. In
-  // certain cases this can lead to a wrong hint being used for the base
-  // type, for example:
-  //
-  // typedef foo my_foo;
-  // typedef foo foo_t;
-  // typedef const foo_t cfoo;
-  //
-  // const my_foo x;
-  //
-  // Above, the hint will be foo_t while it should be my_foo.
-  //
-  tree bt (0);
-
-  if (tree decl = TYPE_NAME (t))
   {
-    bt = TREE_TYPE (decl);
+    cl::QualType s (qt);
 
-    if (t == bt)
+    while (!s.hasLocalQualifiers ())
     {
-      // A const type can be named only with a typedef. Get the
-      // original type.
-      //
-      tree ot (DECL_ORIGINAL_TYPE (decl));
+      cl::QualType n (s.getSingleStepDesugaredType (odbc::ast ()));
 
-      // And chase it one more time to get rid of the qualification.
-      //
-      decl = TYPE_NAME (ot);
-      bt = decl != 0 ? TREE_TYPE (decl) : 0;
+      if (n == s)
+        break;
+
+      s = n;
+    }
+
+    if (s.hasLocalQualifiers ())
+    {
+      if (names* hint = unit_->find_hint (
+            odbc::make (s.getLocalUnqualifiedType ())))
+        e.hint (*hint);
     }
   }
 
-  if (bt != 0)
-  {
-    if (names* hint = unit_->find_hint (bt))
-      e.hint (*hint);
-  }
-
-  process_named_pragmas (t, q);
+  process_named_pragmas (TYPE_MAIN_VARIANT (t), q);
 
   return q;
 }
@@ -1760,7 +1590,12 @@ create_type (tree t,
              size_t clmn)
 {
   type* r (0);
-  gcc_tree_code_type tc (TREE_CODE (t));
+
+  cl::ASTContext& ctx (odbc::ast ());
+  cl::QualType qt (odbc::type (t));
+  cl::QualType mvt (main_variant (qt));
+  tree mv (odbc::make (mvt));
+  gcc_tree_code_type tc (TREE_CODE (mv));
 
   switch (tc)
   {
@@ -1770,10 +1605,15 @@ create_type (tree t,
   case RECORD_TYPE:
   case UNION_TYPE:
     {
-      t = TYPE_MAIN_VARIANT (t);
-      tree ti (TYPE_TEMPLATE_INFO (t));
+      t = mv;
+      cl::CXXRecordDecl const* rd (odbc::record_decl (t));
 
-      if (ti == NULL_TREE)
+      cl::ClassTemplateSpecializationDecl const* sd (
+        rd != 0
+        ? cl::dyn_cast<cl::ClassTemplateSpecializationDecl> (rd)
+        : 0);
+
+      if (sd == 0)
       {
         // Ordinary class. There are two situations which can lead
         // here. First is when we have an anonymous class that is
@@ -1786,87 +1626,66 @@ create_type (tree t,
         // create a "stub" class node which will be processed and
         // filled in later.
         //
+        if (trace)
+          ts << "start anon/stub " << gcc_tree_code_name (tc) << " at "
+             << file << ":" << line << endl;
 
-        // Pointers to member functions are represented as record
-        // types. Detect and handle this case.
-        //
-        if (TYPE_PTRMEMFUNC_P (t))
+        if (rd == 0 || odbc::anonymous_type (t))
         {
-          r = &unit_->new_node<unsupported_type> (
-            file, line, clmn, t, "pointer_to_member_function_type");
-          unit_->insert (t, *r);
+          if (tc == RECORD_TYPE)
+            r = &emit_class<class_> (t, file, line, clmn);
+          else
+            r = &emit_union<union_> (t, file, line, clmn);
         }
         else
         {
-          tree d (TYPE_NAME (t));
+          // Use the "defining" declaration's file, line, and column
+          // information to create the stub.
+          //
+          location_t dl (dloc (rd));
+          path f (LOCATION_FILE (dl));
+          size_t l (LOCATION_LINE (dl));
+          size_t c (LOCATION_COLUMN (dl));
 
-          if (trace)
-            ts << "start anon/stub " << gcc_tree_code_name(tc) << " at "
-               << file << ":" << line << endl;
-
-          if (d == NULL_TREE || IDENTIFIER_ANON_P (DECL_NAME (d)))
-          {
-            if (tc == RECORD_TYPE)
-              r = &emit_class<class_> (t, file, line, clmn);
-            else
-              r = &emit_union<union_> (t, file, line, clmn);
-          }
+          if (tc == RECORD_TYPE)
+            r = &emit_class<class_> (t, f, l, c, true);
           else
-          {
-            // Use the "defining" declaration's file, line, and column
-            // information to create the stub.
-            //
-            path f (DECL_SOURCE_FILE (d));
-            size_t l (DECL_SOURCE_LINE (d));
-            size_t c (DECL_SOURCE_COLUMN (d));
-
-            if (tc == RECORD_TYPE)
-              r = &emit_class<class_> (t, f, l, c, true);
-            else
-              r = &emit_union<union_> (t, f, l, c, true);
-          }
-
-          if (trace)
-            ts << "end anon/stub " << gcc_tree_code_name(tc) << " (" << r << ")"
-               << " at " << file << ":" << line << endl;
+            r = &emit_union<union_> (t, f, l, c, true);
         }
+
+        if (trace)
+          ts << "end anon/stub " << gcc_tree_code_name (tc) << " (" << r
+             << ")" << " at " << file << ":" << line << endl;
       }
       else
       {
         // Template instantiation.
         //
-        tree decl (TI_TEMPLATE (ti)); // DECL_TEMPLATE
+        cl::ClassTemplateDecl const* decl (sd->getSpecializedTemplate ());
 
         // Get to the most general template declaration.
         //
-        while (DECL_TEMPLATE_INFO (decl))
-          decl = DECL_TI_TEMPLATE (decl);
+        while (cl::ClassTemplateDecl const* m =
+                 decl->getInstantiatedFromMemberTemplate ())
+          decl = m;
 
         type_template* t_node (0);
 
         // Find the template node or create a stub if none exist.
         //
-        if (node* n = unit_->find (decl))
+        if (node* n = unit_->find (template_key (decl)))
           t_node = &dynamic_cast<type_template&> (*n);
         else
         {
-          if (trace)
-            ts << "start stub " << gcc_tree_code_name(tc) << " template for ("
-               << decl << ") at " << file << ":" << line << endl;
-
           if (tc == RECORD_TYPE)
             t_node = &emit_class_template (decl, true);
           else
             t_node = &emit_union_template (decl, true);
-
-          if (trace)
-            ts << "end stub " << gcc_tree_code_name(tc) << " template ("
-               << t_node << ") at " << file << ":" << line << endl;
         }
 
         if (trace)
-          ts << "start " << gcc_tree_code_name(tc) << " instantiation ("
-             << t << ") for template (" << t_node << ")"
+          ts << "start " << gcc_tree_code_name (tc) << " instantiation "
+             << emit_type_name (t) << " for template (" << t_node << ")"
              << " at " << file << ":" << line << endl;
 
         type_instantiation* i_node (0);
@@ -1877,7 +1696,7 @@ create_type (tree t,
           i_node = &emit_union<union_instantiation> (t, file, line, clmn);
 
         if (trace)
-          ts << "end " << gcc_tree_code_name(tc) << " instantiation ("
+          ts << "end " << gcc_tree_code_name (tc) << " instantiation ("
              << static_cast<type*> (i_node) << ")"
              << " at " << file << ":" << line << endl;
 
@@ -1893,33 +1712,22 @@ create_type (tree t,
       // The same logic as in the "ordinary class" case above
       // applies here.
       //
+      t = mv;
+      cl::TagDecl const* ed (mvt->getAsTagDecl ());
 
-      t = TYPE_MAIN_VARIANT (t);
-      tree d (TYPE_NAME (t));
-
-      if (trace)
-        ts << "start anon/stub " << gcc_tree_code_name(tc) << " at "
-           << file << ":" << line << endl;
-
-      if (d == NULL_TREE || IDENTIFIER_ANON_P (DECL_NAME (d)))
-      {
+      if (odbc::anonymous_type (t))
         r = &emit_enum (t, access, file, line, clmn);
-      }
       else
       {
-        // Use the "defining" declaration's file, line, and column
-        // information to create the stub.
-        //
-        path f (DECL_SOURCE_FILE (d));
-        size_t l (DECL_SOURCE_LINE (d));
-        size_t c (DECL_SOURCE_COLUMN (d));
+        location_t dl (dloc (ed->getDefinition () != 0
+                             ? ed->getDefinition ()
+                             : ed));
+        path f (LOCATION_FILE (dl));
+        size_t l (LOCATION_LINE (dl));
+        size_t c (LOCATION_COLUMN (dl));
 
         r = &emit_enum (t, access, f, l, c, true);
       }
-
-      if (trace)
-        ts << "end anon/stub " << gcc_tree_code_name(tc) << " (" << r << ")"
-           << " at " << file << ":" << line << endl;
 
       break;
     }
@@ -1930,49 +1738,31 @@ create_type (tree t,
 
   case ARRAY_TYPE:
     {
+      cl::ArrayType const* at (ctx.getAsArrayType (qt));
       unsigned long long size (0);
 
-      if (tree index = TYPE_DOMAIN (t))
+      if (cl::ConstantArrayType const* ca =
+            cl::dyn_cast<cl::ConstantArrayType> (at))
+        size = ca->getZExtSize ();
+      else if (!cl::isa<cl::IncompleteArrayType> (at))
       {
-        tree max (TYPE_MAX_VALUE (index));
+        error (file, line, clmn)
+          << "non-integer array index" << endl;
 
-        if (TREE_CODE (max) == INTEGER_CST)
-        {
-          size = integer_value (max);
-
-          // The docs say that TYPE_DOMAIN will be NULL if the
-          // array doesn't specify bounds. In reality, it is
-          // set to ~0.
-          //
-          if (size == ~(unsigned long long) (0))
-            size = 0;
-
-          size++; // Convert max index to size.
-        }
-        else
-        {
-          error (file, line, clmn)
-            << "non-integer array index " <<
-            gcc_tree_code_name(TREE_CODE (max)) << endl;
-
-          throw failed ();
-        }
+        throw failed ();
       }
 
-      // In GCC tree a const array has both the array type itself and the
-      // element type marked as const. This doesn't bode well with our
-      // semantic graph model where we have a separate type node for
-      // qualifiers. To fix this, we are going to strip the const
-      // qualification from the element type and only preserve it in
-      // the array type. In other words, we view it as "constant array"
-      // rather than "array of constant elements".
+      // In our semantic graph model we have a separate type node for
+      // qualifiers. So we strip the qualification from the element type
+      // and only preserve it in the array type. In other words, we view
+      // it as "constant array" rather than "array of constant elements".
       //
       using semantics::array; // vs std::array.
 
-      tree bt (TREE_TYPE (t));
-      tree bt_mv (TYPE_MAIN_VARIANT (bt));
+      cl::QualType bt (at->getElementType ());
+      tree bt_mv (odbc::make (main_variant (bt)));
       type& bt_node (emit_type (bt_mv, access::public_, file, line, clmn));
-      t = TYPE_MAIN_VARIANT (t);
+      t = mv;
       array& a (unit_->new_node<array> (file, line, clmn, t, size));
       unit_->insert (t, a);
       contains& edge (unit_->new_edge<contains> (a, bt_node));
@@ -1980,7 +1770,7 @@ create_type (tree t,
       // See if there is a name hint for the base type.
       //
       if (names* hint = unit_->find_hint (
-            cp_type_quals (bt) == TYPE_UNQUALIFIED ? bt : bt_mv))
+            bt.hasLocalQualifiers () ? bt_mv : odbc::make (bt)))
         edge.hint (*hint);
 
       process_named_pragmas (t, a);
@@ -1989,9 +1779,9 @@ create_type (tree t,
     }
   case REFERENCE_TYPE:
     {
-      tree bt (TREE_TYPE (t));
+      tree bt (odbc::make (qt->getAs<cl::ReferenceType> ()->getPointeeType ()));
       type& bt_node (emit_type (bt, access::public_, file, line, clmn));
-      t = TYPE_MAIN_VARIANT (t);
+      t = mv;
       reference& ref (unit_->new_node<reference> (file, line, clmn, t));
       unit_->insert (t, ref);
       references& edge (unit_->new_edge<references> (ref, bt_node));
@@ -2007,45 +1797,47 @@ create_type (tree t,
     }
   case POINTER_TYPE:
     {
-      if (!TYPE_PTRMEM_P (t))
-      {
-        tree bt (TREE_TYPE (t));
-        type& bt_node (emit_type (bt, access::public_, file, line, clmn));
-        t = TYPE_MAIN_VARIANT (t);
-        pointer& p (unit_->new_node<pointer> (file, line, clmn, t));
-        unit_->insert (t, p);
-        points& edge (unit_->new_edge<points> (p, bt_node));
+      tree bt (odbc::make (qt->getPointeeType ()));
+      type& bt_node (emit_type (bt, access::public_, file, line, clmn));
+      t = mv;
+      pointer& p (unit_->new_node<pointer> (file, line, clmn, t));
+      unit_->insert (t, p);
+      points& edge (unit_->new_edge<points> (p, bt_node));
 
-        // See if there is a name hint for the base type.
-        //
-        if (names* hint = unit_->find_hint (bt))
-          edge.hint (*hint);
+      // See if there is a name hint for the base type.
+      //
+      if (names* hint = unit_->find_hint (bt))
+        edge.hint (*hint);
 
-        process_named_pragmas (t, p);
-        r = &p;
-      }
-      else
-      {
-        t = TYPE_MAIN_VARIANT (t);
-        r = &unit_->new_node<unsupported_type> (
-          file, line, clmn, t, "pointer_to_data_member_type");
-        unit_->insert (t, *r);
+      process_named_pragmas (t, p);
+      r = &p;
+      break;
+    }
+  case OFFSET_TYPE:
+    {
+      t = mv;
+      char const* k (
+        mvt->getAs<cl::MemberPointerType> ()->isMemberFunctionPointer ()
+        ? "pointer_to_member_function_type"
+        : "pointer_to_data_member_type");
 
-        if (trace)
-          ts << "unsupported pointer_to_data_member_type (" << r << ")"
-             << " at " << file << ":" << line << endl;
-      }
+      r = &unit_->new_node<unsupported_type> (file, line, clmn, t, k);
+      unit_->insert (t, *r);
+
+      if (trace)
+        ts << "unsupported " << k << " (" << r << ")"
+           << " at " << file << ":" << line << endl;
       break;
     }
   default:
     {
-      t = TYPE_MAIN_VARIANT (t);
+      t = mv;
       r = &unit_->new_node<unsupported_type> (
-        file, line, clmn, t, gcc_tree_code_name(tc));
+        file, line, clmn, t, gcc_tree_code_name (tc));
       unit_->insert (t, *r);
 
       if (trace)
-        ts << "unsupported " << gcc_tree_code_name(tc) << " (" << r << ")"
+        ts << "unsupported " << gcc_tree_code_name (tc) << " (" << r << ")"
            << " at " << file << ":" << line << endl;
 
       break;
@@ -2056,189 +1848,10 @@ create_type (tree t,
 }
 
 string parser::impl::
-emit_type_name (tree type, bool direct)
+emit_type_name (tree t)
 {
-  // First see if there is a "direct" name for this type.
-  //
-  if (direct)
-  {
-    if (tree decl = TYPE_NAME (type))
-    {
-      tree t (TREE_TYPE (decl));
-
-      if (t != 0 && same_type_p (type, t))
-        return IDENTIFIER_POINTER (DECL_NAME (decl));
-    }
-  }
-
-  string r;
-
-  if (CP_TYPE_CONST_P (type))
-    r += " const";
-
-  if (CP_TYPE_VOLATILE_P (type))
-    r += " volatile";
-
-  if (CP_TYPE_RESTRICT_P (type))
-    r += " __restrict";
-
-  gcc_tree_code_type tc (TREE_CODE (type));
-
-  switch (tc)
-  {
-    //
-    // User-defined types.
-    //
-
-  case RECORD_TYPE:
-  case UNION_TYPE:
-    {
-      tree ti (TYPE_TEMPLATE_INFO (type));
-
-      if (ti == NULL_TREE)
-      {
-        // Ordinary class.
-        //
-        type = TYPE_MAIN_VARIANT (type);
-
-        // Pointers to member functions are represented as record
-        // types and don't have names, not even the synthesized ones.
-        //
-        if (TYPE_PTRMEMFUNC_P (type))
-          r = "<pointer-to-member-function>" + r;
-        else
-        {
-          tree name (TYPE_NAME (type));
-          r = IDENTIFIER_POINTER (DECL_NAME (name)) + r;
-        }
-      }
-      else
-      {
-        // Template instantiation.
-        //
-        tree decl (TI_TEMPLATE (ti)); // DECL_TEMPLATE
-        string id (IDENTIFIER_POINTER (DECL_NAME (decl)));
-
-        id += '<';
-
-        tree args (INNERMOST_TEMPLATE_ARGS (TI_ARGS (ti)));
-
-        for (size_t i (0), n (TREE_VEC_LENGTH (args)); i < n ; ++i)
-        {
-          tree a (TREE_VEC_ELT (args, i));
-
-          if (i != 0)
-            id += ", ";
-
-          // Assume integer and type-only arguments.
-          //
-          if (TREE_CODE (a) == INTEGER_CST)
-            id += to_string (integer_value (a));
-          else
-            id += emit_type_name (a);
-        }
-
-        id += '>';
-
-        r = id + r;
-      }
-
-      break;
-    }
-
-  case ENUMERAL_TYPE:
-    {
-      type = TYPE_MAIN_VARIANT (type);
-      tree decl (TYPE_NAME (type));
-      r = IDENTIFIER_POINTER (DECL_NAME (decl)) + r;
-      break;
-    }
-
-    //
-    // Derived types.
-    //
-
-  case ARRAY_TYPE:
-    {
-      unsigned long long size (0);
-
-      if (tree index = TYPE_DOMAIN (type))
-      {
-        tree max (TYPE_MAX_VALUE (index));
-
-        if (TREE_CODE (max) == INTEGER_CST)
-        {
-          size = integer_value (max);
-
-          // Same as above.
-          //
-          if (size == ~(unsigned long long) (0))
-            size = 0;
-
-          size++;
-        }
-        else
-        {
-          // Non-integer array index which we do not support. The
-          // error has been/will be issued in emit_type.
-          //
-        }
-      }
-
-      tree t (TREE_TYPE (type));
-
-      if (size != 0)
-      {
-        ostringstream ostr;
-        ostr << size;
-        r = emit_type_name (t) + "[" + ostr.str () + "]" + r;
-      }
-      else
-        r = emit_type_name (t) + "[]" + r;
-
-      break;
-    }
-  case REFERENCE_TYPE:
-    {
-      tree t (TREE_TYPE (type));
-      r = emit_type_name (t) + "&" + r;
-      break;
-    }
-  case POINTER_TYPE:
-    {
-      if (!TYPE_PTRMEM_P (type))
-      {
-        tree t (TREE_TYPE (type));
-        r = emit_type_name (t) + "*" + r;
-      }
-      else
-        r = "<pointer_to_member_type>";
-
-      break;
-    }
-
-    //
-    // Fundamental types.
-    //
-
-  case VOID_TYPE:
-  case REAL_TYPE:
-  case BOOLEAN_TYPE:
-  case INTEGER_TYPE:
-    {
-      type = TYPE_MAIN_VARIANT (type);
-      tree decl (TYPE_NAME (type));
-      r = IDENTIFIER_POINTER (DECL_NAME (decl)) + r;
-      break;
-    }
-  default:
-    {
-      r = "<" + string (gcc_tree_code_name(tc)) + ">";
-      break;
-    }
-  }
-
-  return r;
+  cl::QualType qt (any_type (t));
+  return qt.isNull () ? string ("<unknown>") : odbc::type_as_string (qt);
 }
 
 void parser::impl::
@@ -2345,36 +1958,21 @@ diagnose_unassoc_pragmas (decl_set const& decls)
   }
 }
 
-string parser::impl::
-fq_scope (tree decl)
+void parser::impl::
+ns_chain (cl::Decl const* d, vector<cl::NamespaceDecl const*>& r)
 {
-  string s, tmp;
-
-  for (tree scope (CP_DECL_CONTEXT (decl));
-       scope != global_namespace;)
+  for (cl::DeclContext const* dc (d->getDeclContext ());
+       dc != 0;
+       dc = dc->getParent ())
   {
-    tree prev (CP_DECL_CONTEXT (scope));
-
-    // If this is an inline namespace, pretend it doesn't exist.
-    //
-#if BUILDING_GCC_MAJOR >= 8
-    if (!is_nested_namespace (prev, scope, true))
-#else
-    if (!is_associated_namespace (prev, scope))
-#endif
+    if (cl::NamespaceDecl const* n = cl::dyn_cast<cl::NamespaceDecl> (dc))
     {
-      tree n = DECL_NAME (scope);
-
-      tmp = "::";
-      tmp += (n != NULL_TREE ? IDENTIFIER_POINTER (n) : "");
-      tmp += s;
-      s.swap (tmp);
+      // If this is an inline namespace, pretend it doesn't exist.
+      //
+      if (!n->isInline ())
+        r.insert (r.begin (), n->getCanonicalDecl ());
     }
-
-    scope = prev;
   }
-
-  return s;
 }
 
 //

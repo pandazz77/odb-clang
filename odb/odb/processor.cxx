@@ -1,7 +1,7 @@
 // file      : odb/processor.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
 #include <iostream>
 #include <algorithm> // std::find
@@ -239,26 +239,22 @@ namespace
     //
     found_type
     check_accessor (semantics::data_member& m,
-                    tree f,
+                    odbc::member_function const& f,
                     string const& n,
                     member_access& ma,
                     bool strict)
     {
       // Must be const.
       //
-      if (!DECL_CONST_MEMFUNC_P (f))
+      if (!f.const_)
         return found_none;
 
       // Accessor is a function with no arguments (other than 'this').
       //
-      if (FUNCTION_FIRST_USER_PARMTYPE (f) != void_list_node)
+      if (!f.params.empty ())
         return found_none;
 
-      // Note that to get the return type we have to use
-      // TREE_TYPE(TREE_TYPE()) and not DECL_RESULT, as
-      // suggested in the documentation.
-      //
-      tree r (TYPE_MAIN_VARIANT (TREE_TYPE (TREE_TYPE (f))));
+      tree r (TYPE_MAIN_VARIANT (odbc::make (f.result)));
       gcc_tree_code_type tc (TREE_CODE (r));
 
       // In the strict mode make sure the function returns for non-array
@@ -280,7 +276,7 @@ namespace
         if ((ar != 0 ? ar->base_type () : t).tree_node () != bt_mv)
           return found_none;
       }
-      else if (r == void_type_node)
+      else if (TREE_CODE (r) == VOID_TYPE)
         return found_none;
 
       cxx_tokens& e (ma.expr);
@@ -301,12 +297,11 @@ namespace
     //
     found_type
     check_modifier (semantics::data_member& m,
-                    tree f,
+                    odbc::member_function const& f,
                     string const& n,
                     member_access& ma,
                     bool strict)
     {
-      tree a (FUNCTION_FIRST_USER_PARMTYPE (f));
 
       // For a modifier, it can either be a function that returns a non-
       // const reference (or non-const pointer, in case the member is an
@@ -317,13 +312,9 @@ namespace
       semantics::type& t (utype (m));
       semantics::array* ar (dynamic_cast<semantics::array*> (&t));
 
-      if (a == void_list_node)
+      if (f.params.empty ())
       {
-        // Note that to get the return type we have to use
-        // TREE_TYPE(TREE_TYPE()) and not DECL_RESULT, as
-        // suggested in the documentation.
-        //
-        tree r (TYPE_MAIN_VARIANT (TREE_TYPE (TREE_TYPE (f))));
+        tree r (TYPE_MAIN_VARIANT (odbc::make (f.result)));
         gcc_tree_code_type tc (TREE_CODE (r));
 
         // By-reference modifier. Should return a reference or a pointer.
@@ -356,7 +347,7 @@ namespace
       // Otherwise look for a by value modifier, which is a function
       // with a single argument.
       //
-      else if (TREE_CHAIN (a) == void_list_node)
+      else if (f.params.size () == 1)
       {
         // In the lax mode any function with a single argument works
         // for us. And we don't care what it returns.
@@ -367,7 +358,7 @@ namespace
           // member. This is exactly the same logic as in accessor
           // with regards to arrays, references, etc.
           //
-          tree at (TREE_VALUE (a));
+          tree at (odbc::make (f.params[0]));
           gcc_tree_code_type tc (TREE_CODE (at));
 
           if (ar != 0 && tc != POINTER_TYPE)
@@ -481,42 +472,21 @@ namespace
             if (t)
               cerr << "'" << n << "' : ";
 
-            tree decl (
-              lookup_qualified_name (
-                c.tree_node (), get_identifier (n.c_str ()), false, false));
+            vector<odbc::member_function> fs;
 
-            if (decl == error_mark_node || TREE_CODE (decl) != BASELINK)
+            if (!odbc::lookup_member_functions (c.tree_node (), n, fs))
             {
               if (t)
                 cerr << '-' << endl;
               continue;
             }
 
-            // OVL_* macros work for both FUNCTION_DECL and OVERLOAD.
-            //
-#if BUILDING_GCC_MAJOR >= 8
-            for (ovl_iterator i (BASELINK_FUNCTIONS (decl)); i; ++i)
-#else
-            for (tree o (BASELINK_FUNCTIONS (decl)); o != 0; o = OVL_NEXT (o))
-#endif
+            for (odbc::member_function const& f: fs)
             {
-#if BUILDING_GCC_MAJOR >= 8
-              tree f (*i);
-#else
-              tree f (OVL_CURRENT (o));
-#endif
               // We are only interested in public non-static member
-              // functions. Note that TREE_PUBLIC() returns something
-              // other than what we need.
+              // functions.
               //
-              if (
-#if BUILDING_GCC_MAJOR >= 14
-                !DECL_OBJECT_MEMBER_FUNCTION_P (f)
-#else
-                !DECL_NONSTATIC_MEMBER_FUNCTION_P (f)
-#endif
-                  || TREE_PRIVATE (f)
-                  || TREE_PROTECTED (f))
+              if (f.static_ || f.deleted || f.access != clang::AS_public)
                 continue;
 
               found_type r (k == "get"
@@ -528,7 +498,8 @@ namespace
                 // Update the location of the access expression to point
                 // to this function.
                 //
-                ma.loc = location (real_source_location (f));
+                ma.loc = location (
+                  odbc::make_location (f.decl->getLocation ()));
                 found = r;
               }
             }
@@ -589,8 +560,7 @@ namespace
         e.clear ();
 
         tree decl (
-          lookup_qualified_name (
-            c.tree_node (), get_identifier (n.c_str ()), false, false));
+          lookup_qualified_name (c.tree_node (), n, false, false));
 
         if (decl == error_mark_node)
         {
@@ -610,28 +580,14 @@ namespace
           }
         case BASELINK:
           {
-            // OVL_* macros work for both FUNCTION_DECL and OVERLOAD.
-            //
-#if BUILDING_GCC_MAJOR >= 8
-            for (ovl_iterator i (BASELINK_FUNCTIONS (decl)); i; ++i)
-#else
-            for (tree o (BASELINK_FUNCTIONS (decl)); o != 0; o = OVL_NEXT (o))
-#endif
+            vector<odbc::member_function> fs;
+            odbc::lookup_member_functions (c.tree_node (), n, fs);
+
+            for (odbc::member_function const& f: fs)
             {
-#if BUILDING_GCC_MAJOR >= 8
-              tree f (*i);
-#else
-              tree f (OVL_CURRENT (o));
-#endif
               // We are only interested in non-static member functions.
               //
-              if (
-#if BUILDING_GCC_MAJOR >= 14
-                !DECL_OBJECT_MEMBER_FUNCTION_P (f)
-#else
-                !DECL_NONSTATIC_MEMBER_FUNCTION_P (f)
-#endif
-              )
+              if (f.static_ || f.deleted)
                 continue;
 
               if ((k == "get"
@@ -717,9 +673,8 @@ namespace
             // case of an error. Use the location of the virtual pragma.
             //
             location_t loc (m.get<location_t> ("virtual-location"));
-            input_location = loc;
 
-            if (instantiate_class_template (type) == error_mark_node ||
+            if (instantiate_class_template (type, loc) == error_mark_node ||
                 errorcount != 0 ||
                 !COMPLETE_TYPE_P (type))
             {
@@ -1024,7 +979,7 @@ namespace
       {
         tree decl (
           lookup_qualified_name (
-            inst, get_identifier ("wrapped_type"), true, false));
+            inst, "wrapped_type", true, false));
 
         if (decl == error_mark_node || TREE_CODE (decl) != TYPE_DECL)
           throw operation_failed ();
@@ -1103,26 +1058,12 @@ namespace
 
       try
       {
-        tree nh (
-          lookup_qualified_name (
-            inst, get_identifier ("null_handler"), false, false));
+        unsigned long long init;
 
-        if (nh == error_mark_node || TREE_CODE (nh) != VAR_DECL)
+        if (!odbc::static_member_value (inst, "null_handler", init))
           throw operation_failed ();
 
-        // Instantiate this decalaration so that we can get its value.
-        //
-        if (DECL_TEMPLATE_INSTANTIATION (nh) &&
-            !DECL_TEMPLATE_INSTANTIATED (nh) &&
-            !DECL_EXPLICIT_INSTANTIATION (nh))
-          instantiate_decl (nh, false, false);
-
-        tree init (DECL_INITIAL (nh));
-
-        if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
-          throw operation_failed ();
-
-        null_handler = static_cast<bool> (integer_value (init));
+        null_handler = static_cast<bool> (init);
         t.set ("wrapper-null-handler", null_handler);
       }
       catch (operation_failed const&)
@@ -1139,27 +1080,13 @@ namespace
       {
         try
         {
-          tree nh (
-            lookup_qualified_name (
-              inst, get_identifier ("null_default"), false, false));
+          unsigned long long init;
 
-          if (nh == error_mark_node || TREE_CODE (nh) != VAR_DECL)
-            throw operation_failed ();
-
-          // Instantiate this decalaration so that we can get its value.
-          //
-          if (DECL_TEMPLATE_INSTANTIATION (nh) &&
-              !DECL_TEMPLATE_INSTANTIATED (nh) &&
-              !DECL_EXPLICIT_INSTANTIATION (nh))
-            instantiate_decl (nh, false, false);
-
-          tree init (DECL_INITIAL (nh));
-
-          if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
+          if (!odbc::static_member_value (inst, "null_default", init))
             throw operation_failed ();
 
           t.set ("wrapper-null-default",
-                 static_cast<bool> (integer_value (init)));
+                 static_cast<bool> (init));
         }
         catch (operation_failed const&)
         {
@@ -1218,7 +1145,7 @@ namespace
         {
           tree decl (
             lookup_qualified_name (
-              inst, get_identifier ("element_type"), true, false));
+              inst, "element_type", true, false));
 
           if (decl == error_mark_node || TREE_CODE (decl) != TYPE_DECL)
             throw operation_failed ();
@@ -1244,27 +1171,13 @@ namespace
         //
         try
         {
-          tree kind (
-            lookup_qualified_name (
-              inst, get_identifier ("kind"), false, false));
+          unsigned long long init;
 
-          if (kind == error_mark_node || TREE_CODE (kind) != VAR_DECL)
-            throw operation_failed ();
-
-          // Instantiate this decalaration so that we can get its value.
-          //
-          if (DECL_TEMPLATE_INSTANTIATION (kind) &&
-              !DECL_TEMPLATE_INSTANTIATED (kind) &&
-              !DECL_EXPLICIT_INSTANTIATION (kind))
-            instantiate_decl (kind, false, false);
-
-          tree init (DECL_INITIAL (kind));
-
-          if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
+          if (!odbc::static_member_value (inst, "kind", init))
             throw operation_failed ();
 
           pointer_kind_type pk = static_cast<pointer_kind_type> (
-            integer_value (init));
+            init);
           t.set ("pointer-kind", pk);
         }
         catch (operation_failed const&)
@@ -1278,26 +1191,12 @@ namespace
         //
         try
         {
-          tree lazy (
-            lookup_qualified_name (
-              inst, get_identifier ("lazy"), false, false));
+          unsigned long long init;
 
-          if (lazy == error_mark_node || TREE_CODE (lazy) != VAR_DECL)
+          if (!odbc::static_member_value (inst, "lazy", init))
             throw operation_failed ();
 
-          // Instantiate this decalaration so that we can get its value.
-          //
-          if (DECL_TEMPLATE_INSTANTIATION (lazy) &&
-              !DECL_TEMPLATE_INSTANTIATED (lazy) &&
-              !DECL_EXPLICIT_INSTANTIATION (lazy))
-            instantiate_decl (lazy, false, false);
-
-          tree init (DECL_INITIAL (lazy));
-
-          if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
-            throw operation_failed ();
-
-          t.set ("pointer-lazy", static_cast<bool> (integer_value (init)));
+          t.set ("pointer-lazy", static_cast<bool> (init));
         }
         catch (operation_failed const&)
         {
@@ -1665,26 +1564,12 @@ namespace
         //
         try
         {
-          tree decl (
-            lookup_qualified_name (
-              inst, get_identifier ("kind"), false, false));
+          unsigned long long init;
 
-          if (decl == error_mark_node || TREE_CODE (decl) != VAR_DECL)
+          if (!odbc::static_member_value (inst, "kind", init))
             throw operation_failed ();
 
-          // Instantiate this decalaration so that we can get its value.
-          //
-          if (DECL_TEMPLATE_INSTANTIATION (decl) &&
-              !DECL_TEMPLATE_INSTANTIATED (decl) &&
-              !DECL_EXPLICIT_INSTANTIATION (decl))
-            instantiate_decl (decl, false, false);
-
-          tree init (DECL_INITIAL (decl));
-
-          if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
-            throw operation_failed ();
-
-          ck = static_cast<container_kind_type> (integer_value (init));
+          ck = static_cast<container_kind_type> (init);
         }
         catch (operation_failed const&)
         {
@@ -1701,26 +1586,12 @@ namespace
         //
         try
         {
-          tree decl (
-            lookup_qualified_name (
-              inst, get_identifier ("smart"), false, false));
+          unsigned long long init;
 
-          if (decl == error_mark_node || TREE_CODE (decl) != VAR_DECL)
+          if (!odbc::static_member_value (inst, "smart", init))
             throw operation_failed ();
 
-          // Instantiate this decalaration so that we can get its value.
-          //
-          if (DECL_TEMPLATE_INSTANTIATION (decl) &&
-              !DECL_TEMPLATE_INSTANTIATED (decl) &&
-              !DECL_EXPLICIT_INSTANTIATION (decl))
-            instantiate_decl (decl, false, false);
-
-          tree init (DECL_INITIAL (decl));
-
-          if (init == error_mark_node || TREE_CODE (init) != INTEGER_CST)
-            throw operation_failed ();
-
-          smart = static_cast<bool> (integer_value (init));
+          smart = static_cast<bool> (init);
         }
         catch (operation_failed const&)
         {
@@ -1749,7 +1620,7 @@ namespace
         //
         {
           tree decl (lookup_qualified_name (
-                       inst, get_identifier ("value_type"), true, false));
+                       inst, "value_type", true, false));
 
           if (decl == error_mark_node || TREE_CODE (decl) != TYPE_DECL)
           {
@@ -1796,7 +1667,7 @@ namespace
         {
           tree decl (
             lookup_qualified_name (
-              inst, get_identifier ("index_type"), true, false));
+              inst, "index_type", true, false));
 
           if (decl == error_mark_node || TREE_CODE (decl) != TYPE_DECL)
           {
@@ -1833,7 +1704,7 @@ namespace
         {
           tree decl (
             lookup_qualified_name (
-              inst, get_identifier ("key_type"), true, false));
+              inst, "key_type", true, false));
 
           if (decl == error_mark_node || TREE_CODE (decl) != TYPE_DECL)
           {
@@ -2084,7 +1955,7 @@ namespace
       // Find the odb namespace.
       //
       tree odb = lookup_qualified_name (
-        global_namespace, get_identifier ("odb"), false, false);
+        global_namespace, "odb", false, false);
 
       if (odb == error_mark_node)
       {
@@ -2097,7 +1968,7 @@ namespace
       // Find wrapper traits.
       //
       wrapper_traits_ = lookup_qualified_name (
-        odb, get_identifier ("wrapper_traits"), true, false);
+        odb, "wrapper_traits", true, false);
 
       if (wrapper_traits_ == error_mark_node ||
           !DECL_CLASS_TEMPLATE_P (wrapper_traits_))
@@ -2111,7 +1982,7 @@ namespace
       // Find pointer traits.
       //
       pointer_traits_ = lookup_qualified_name (
-        odb, get_identifier ("pointer_traits"), true, false);
+        odb, "pointer_traits", true, false);
 
       if (pointer_traits_ == error_mark_node ||
           !DECL_CLASS_TEMPLATE_P (pointer_traits_))
@@ -2125,7 +1996,7 @@ namespace
       // Find the access class.
       //
       tree access = lookup_qualified_name (
-        odb, get_identifier ("access"), true, false);
+        odb, "access", true, false);
 
       if (access == error_mark_node)
       {
@@ -2140,7 +2011,7 @@ namespace
       // Find container_traits.
       //
       container_traits_ = lookup_qualified_name (
-        access, get_identifier ("container_traits"), true, false);
+        access, "container_traits", true, false);
 
       if (container_traits_ == error_mark_node ||
           !DECL_CLASS_TEMPLATE_P (container_traits_))
@@ -2155,44 +2026,21 @@ namespace
     static tree
     instantiate_template (tree t, tree arg)
     {
-      tree args (make_tree_vec (1));
-      TREE_VEC_ELT (args, 0) = arg;
-
       // This step should succeed regardles of whether there is a
-      // specialization for this type.
+      // specialization for this type. If we cannot instantiate this
+      // type, assume there is no suitable specialization for it.
       //
-      tree inst (
-        lookup_template_class (t,
-                               args,
-                               0,
-                               0,
-#if BUILDING_GCC_MAJOR < 15
-                               0 /* entering_scope */,
-#endif
-                               tf_warning_or_error));
-
-      if (inst == error_mark_node)
+      try
       {
-        // Diagnostics has already been issued by lookup_template_class.
+        tree inst (odbc::instantiate_template (t, arg));
+        return inst ? inst : tree (0);
+      }
+      catch (odbc::failed const&)
+      {
+        // Diagnostics has already been issued.
         //
         throw operation_failed ();
       }
-
-      inst = TYPE_MAIN_VARIANT (inst);
-
-      // The instantiation may already be complete if it matches a
-      // (complete) specialization or was used before.
-      //
-      if (!COMPLETE_TYPE_P (inst))
-        inst = instantiate_class_template (inst);
-
-      // If we cannot instantiate this type, assume there is no suitable
-      // specialization for it.
-      //
-      if (inst == error_mark_node || !COMPLETE_TYPE_P (inst))
-        return 0;
-
-      return inst;
     }
 
   private:
@@ -2379,12 +2227,12 @@ namespace
       // Resolve odb::access, if any.
       //
       tree odb = lookup_qualified_name (
-        global_namespace, get_identifier ("odb"), false, false);
+        global_namespace, "odb", false, false);
 
       if (odb != error_mark_node)
       {
         access_ = lookup_qualified_name (
-          odb, get_identifier ("access"), true, false);
+          odb, "access", true, false);
 
         access_ = (access_ != error_mark_node ? TREE_TYPE (access_) : 0);
       }
@@ -2402,7 +2250,7 @@ namespace
 
       // Check if odb::access is a friend of this class.
       //
-      c.set ("friend", access_ != 0 && is_friend (c.tree_node (), access_));
+      c.set ("friend", access_ != 0 && odbc::is_friend (c.tree_node (), access_));
 
       // Assign pointer.
       //
@@ -2566,9 +2414,8 @@ namespace
             // used in the translation unit.
             //
             tree t (base.tree_node ());
-            tree ptr (TYPE_POINTER_TO (t));
+            tree ptr (odbc::pointer_to (t));
             assert (ptr != 0);
-            ptr = TYPE_MAIN_VARIANT (ptr);
             pointer& p (unit.new_node<pointer> (f, l, col, ptr));
             unit.insert (ptr, p);
             unit.new_edge<points> (p, base);
@@ -2961,17 +2808,7 @@ namespace
 
               // This can be a typedef'ed alias for a template-id.
               //
-              if (tree ti = TYPE_TEMPLATE_INFO (TREE_TYPE (decl)))
-              {
-                decl = TI_TEMPLATE (ti); // DECL_TEMPLATE
-
-                // Get to the most general template declaration.
-                //
-                while (DECL_TEMPLATE_INFO (decl))
-                  decl = DECL_TI_TEMPLATE (decl);
-              }
-              else
-                decl = 0; // Not a template.
+              decl = odbc::class_template_of (TREE_TYPE (decl));
             }
             else if (tc == TEMPLATE_DECL && DECL_CLASS_TEMPLATE_P (decl))
             {
@@ -3185,11 +3022,7 @@ namespace
                   {
                     tree prev (CP_DECL_CONTEXT (scope));
 
-#if BUILDING_GCC_MAJOR >= 8
-                    if (!is_nested_namespace (prev, scope, true))
-#else
-                    if (!is_associated_namespace (prev, scope))
-#endif
+                    if (!odbc::inline_namespace (scope))
                       break;
 
                     scope = prev;
@@ -3198,7 +3031,7 @@ namespace
                   if (scope != global_namespace)
                   {
                     ptr += "::";
-                    ptr += decl_as_string (scope, TFF_PLAIN_IDENTIFIER);
+                    ptr += odbc::qualified_name (scope);
                   }
 
                   ptr += "::";

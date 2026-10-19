@@ -19,7 +19,7 @@
 #include <libcutl/compiler/type-id.hxx>
 #include <libcutl/compiler/context.hxx>
 
-#include <odb/gcc-fwd.hxx>
+#include <odb/clang-fwd.hxx>
 #include <odb/location.hxx>
 
 namespace semantics

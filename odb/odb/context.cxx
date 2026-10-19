@@ -1,7 +1,7 @@
 // file      : odb/context.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <cctype> // std::toupper
 #include <cassert>

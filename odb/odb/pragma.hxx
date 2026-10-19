@@ -4,7 +4,7 @@
 #ifndef ODB_PRAGMA_HXX
 #define ODB_PRAGMA_HXX
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <map>
 #include <set>
@@ -83,13 +83,13 @@ extern virt_declarations virt_declarations_;
 //
 struct declaration
 {
-  declaration (): virt (false) {decl.real = 0;}
-  declaration (tree d): virt (false) {decl.real = d;}
+  declaration (): virt (false) {decl.virt = 0;}
+  declaration (tree d): virt (false) {decl.real = d; decl.virt = 0;}
   declaration (virt_declaration const& d): virt (true) {decl.virt = &d;}
 
   bool virt;
 
-  union
+  struct
   {
     tree real;
     virt_declaration const* virt;
@@ -104,14 +104,17 @@ struct declaration
   typedef bool declaration::*bool_convertible;
   operator bool_convertible () const
   {
-    return ptr () == 0 ? 0 : &declaration::virt;
+    return (virt ? decl.virt != 0 : static_cast<bool> (decl.real))
+      ? &declaration::virt
+      : 0;
   }
 
 public:
   bool
   operator== (declaration const& x) const
   {
-    return virt == x.virt && ptr () == x.ptr ();
+    return virt == x.virt &&
+      (virt ? decl.virt == x.decl.virt : decl.real == x.decl.real);
   }
 
   bool
@@ -123,16 +126,9 @@ public:
   bool
   operator< (declaration const& x) const
   {
-    return virt < x.virt || (virt == x.virt && ptr () < x.ptr ());
-  }
-
-public:
-  void const*
-  ptr () const
-  {
-    return virt
-      ? static_cast<void const*> (decl.virt)
-      : static_cast<void const*> (decl.real);
+    return virt < x.virt ||
+      (virt == x.virt &&
+       (virt ? decl.virt < x.decl.virt : decl.real < x.decl.real));
   }
 };
 
@@ -276,8 +272,17 @@ extern decl_pragmas decl_pragmas_;
 extern database pragma_db_;
 extern multi_database pragma_multi_;
 
-extern "C" void
-register_odb_pragmas (void*, void*);
+namespace clang {class Preprocessor;}
+
+// Register the db pragma handler with the preprocessor. The pragmas are
+// collected during parsing and processed by process_odb_pragmas() once
+// the translation unit has been parsed.
+//
+void
+register_odb_pragmas (clang::Preprocessor&);
+
+void
+process_odb_pragmas ();
 
 struct pragmas_failed {};
 

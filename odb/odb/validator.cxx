@@ -1,7 +1,7 @@
 // file      : odb/validator.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
 #include <set>
 #include <iostream>
@@ -550,27 +550,15 @@ namespace
       if (c.count ("callback"))
       {
         string name (c.get<string> ("callback"));
-        tree decl (
-          lookup_qualified_name (
-            c.tree_node (), get_identifier (name.c_str ()), false, false));
+        vector<odbc::member_function> fs;
 
-        if (decl != error_mark_node && TREE_CODE (decl) == BASELINK)
+        if (odbc::lookup_member_functions (c.tree_node (), name, fs))
         {
-          // Figure out if we have a const version of the callback. OVL_*
-          // macros work for both FUNCTION_DECL and OVERLOAD.
+          // Figure out if we have a const version of the callback.
           //
-#if BUILDING_GCC_MAJOR >= 8
-          for (ovl_iterator i (BASELINK_FUNCTIONS (decl)); i; ++i)
-#else
-          for (tree o (BASELINK_FUNCTIONS (decl)); o != 0; o = OVL_NEXT (o))
-#endif
+          for (odbc::member_function const& f: fs)
           {
-#if BUILDING_GCC_MAJOR >= 8
-            tree f (*i);
-#else
-            tree f (OVL_CURRENT (o));
-#endif
-            if (DECL_CONST_MEMFUNC_P (f))
+            if (f.const_)
             {
               c.set ("callback-const", true);
               break;
@@ -947,11 +935,9 @@ namespace
       if (c.count ("callback"))
       {
         string name (c.get<string> ("callback"));
-        tree decl (
-          lookup_qualified_name (
-            c.tree_node (), get_identifier (name.c_str ()), false, false));
+        vector<odbc::member_function> fs;
 
-        if (decl == error_mark_node || TREE_CODE (decl) != BASELINK)
+        if (!odbc::lookup_member_functions (c.tree_node (), name, fs))
         {
           os << c.file () << ":" << c.line () << ":" << c.column () << ": "
              << "error: unable to resolve member function '" << name << "' "
@@ -1491,50 +1477,8 @@ namespace
   struct class2: traversal::class_, context
   {
     class2 (bool& valid)
-    : valid_ (valid), has_lt_operator_ (0), typedefs_ (true), member_ (valid)
+    : valid_ (valid), typedefs_ (true), member_ (valid)
     {
-      // Find the has_lt_operator function template.
-      //
-      tree odb (
-        lookup_qualified_name (
-          global_namespace, get_identifier ("odb"), false, false));
-
-      if (odb != error_mark_node)
-      {
-        tree compiler (
-          lookup_qualified_name (
-            odb, get_identifier ("compiler"), false, false));
-
-        if (compiler != error_mark_node)
-        {
-          has_lt_operator_ = lookup_qualified_name (
-            compiler, get_identifier ("has_lt_operator"), false, false);
-
-          if (has_lt_operator_ != error_mark_node)
-          {
-#if BUILDING_GCC_MAJOR >= 8
-            has_lt_operator_ = OVL_FIRST (has_lt_operator_);
-#else
-            has_lt_operator_ = OVL_CURRENT (has_lt_operator_);
-#endif
-          }
-          else
-          {
-            os << unit.file () << ": error: unable to resolve has_lt_operator "
-               << "function template inside odb::compiler" << endl;
-            has_lt_operator_ = 0;
-          }
-        }
-        else
-          os << unit.file () << ": error: unable to resolve compiler "
-             << "namespace inside odb" << endl;
-      }
-      else
-        os << unit.file () << ": error: unable to resolve odb namespace"
-           << endl;
-
-      if (has_lt_operator_ == 0)
-        valid_ = false;
 
       *this >> defines_ >> *this;
       *this >> typedefs_ >> *this;
@@ -1633,45 +1577,9 @@ namespace
         // If this is a session object, make sure that the id type can
         // be compared.
         //
-        if (session (c) && has_lt_operator_ != 0)
+        if (session (c))
         {
-          tree args (make_tree_vec (1));
-          TREE_VEC_ELT (args, 0) = t.tree_node ();
-
-          tree inst (
-            instantiate_template (
-              has_lt_operator_, args, tf_none));
-
-          bool v (inst != error_mark_node);
-
-          // Old version of has_lt_operator() relied on full instantiation
-          // while the new one is based on SFINAE.
-          //
-#if 0
-          if (v &&
-              DECL_TEMPLATE_INSTANTIATION (inst) &&
-              !DECL_TEMPLATE_INSTANTIATED (inst))
-          {
-            // Instantiate this function template to see if the value type
-            // provides operator<. Unfortunately, GCC instantiate_decl()
-            // does not provide any control over the diagnostics it issues
-            // in case of an error. To work around this, we are going to
-            // temporarily redirect diagnostics to /dev/null, which is
-            // where asm_out_file points to (see plugin.cxx).
-            //
-            // Needless to say, this is very hacky and we should quickly fail
-            // (as we do below) if there were errors.
-            //
-            int ec (errorcount);
-            FILE* s (global_dc->printer->buffer->stream);
-            global_dc->printer->buffer->stream = asm_out_file;
-
-            instantiate_decl (inst, false, false);
-
-            global_dc->printer->buffer->stream = s;
-            v = (ec == errorcount);
-          }
-#endif
+          bool v (odbc::has_lt_operator (t.tree_node ()));
 
           if (!v)
           {
@@ -1776,7 +1684,6 @@ namespace
     }
 
     bool& valid_;
-    tree has_lt_operator_;
 
     traversal::defines defines_;
     typedefs typedefs_;

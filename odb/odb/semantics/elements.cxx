@@ -1,7 +1,7 @@
 // file      : odb/semantics/elements.cxx
 // license   : GNU GPL v3; see accompanying LICENSE file
 
-#include <odb/gcc.hxx>
+#include <odb/clang.hxx>
 
 #include <libcutl/compiler/type-info.hxx>
 
@@ -37,10 +37,7 @@ namespace semantics
   node ()
       : loc_ (0)
   {
-    // GCC plugin machinery #define's abort as a macro.
-    //
-    // std::abort ();
-    abort ();
+    std::abort ();
   }
 
   // nameable
@@ -69,14 +66,7 @@ namespace semantics
     tree n (tree_node ());
 
     if (TYPE_P (n))
-    {
-      tree name (0);
-
-      if (tree decl = TYPE_NAME (n))
-        name = DECL_NAME (decl);
-
-      return name != 0 && IDENTIFIER_ANON_P (name);
-    }
+      return odbc::anonymous_type (n);
 
     return true;
   }
@@ -119,38 +109,20 @@ namespace semantics
 
     if (TYPE_P (type))
     {
-      tree name (0);
-
       if (tree decl = TYPE_NAME (type))
       {
-        name = DECL_NAME (decl);
-        if (name != 0 && IDENTIFIER_ANON_P (name))
+        if (odbc::anonymous_type (type))
           return true;
 
         tree s (CP_DECL_CONTEXT (decl));
 
-        gcc_tree_code_type tc (TREE_CODE (s));
-
-        if (tc == TYPE_DECL)
-          s = TREE_TYPE (s);
-        else if (tc == NAMESPACE_DECL)
+        if (TREE_CODE (s) == NAMESPACE_DECL)
         {
           // "Unwind" any inline namespaces since they are not in
           // semantic grapth.
           //
-          while (s != global_namespace)
-          {
-            tree prev (CP_DECL_CONTEXT (s));
-
-#if BUILDING_GCC_MAJOR >= 8
-            if (!is_nested_namespace (prev, s, true))
-#else
-            if (!is_associated_namespace (prev, s))
-#endif
-              break;
-
-            s = prev;
-          }
+          while (s != global_namespace && odbc::inline_namespace (s))
+            s = CP_DECL_CONTEXT (s);
         }
 
         if (nameable* n = dynamic_cast<nameable*> (unit ().find (s)))
@@ -192,17 +164,16 @@ namespace semantics
     bool punc (false);
     bool scoped (false);
 
-    // Names returned by GCC's type_as_string() (on which this function
-    // is called) include inline namespaces (e.g., std::__cxx11::string).
+    // Names returned by type_as_string() (on which this function is
+    // called) may include inline namespaces (e.g., std::__cxx11::string).
     // So, besides fully-qualifying names, this function also needs to get
     // rid of those. The idea is to resolve names as we lex them, skipping
     // inline namespaces and stopping once we reach something other than a
     // namespace.
     //
     tree ns (global_namespace);
-    tree id;
 
-    for (cpp_ttype tt = l.next (t, &id); tt != CPP_EOF; tt = l.next (t, &id))
+    for (cpp_ttype tt = l.next (t); tt != CPP_EOF; tt = l.next (t))
     {
       if (punc && tt > CPP_LAST_PUNCTUATOR)
         r += ' ';
@@ -234,7 +205,7 @@ namespace semantics
           //
           if (ns != 0)
           {
-            new_ns = lookup_qualified_name (ns, id, false, false);
+            new_ns = lookup_qualified_name (ns, t, false, false);
 
             if (new_ns == error_mark_node ||
                 TREE_CODE (new_ns) != NAMESPACE_DECL)
@@ -243,11 +214,7 @@ namespace semantics
             {
               // Check if this is an inline namespace and skip it if so.
               //
-#if BUILDING_GCC_MAJOR >= 8
-              if (is_nested_namespace (ns, new_ns, true))
-#else
-              if (is_associated_namespace (ns, new_ns))
-#endif
+              if (odbc::inline_namespace (new_ns))
               {
                 // Skip also the following scope operator. Strictly speaking
                 // there could be none (i.e., this is a name of an inline
@@ -315,7 +282,7 @@ namespace semantics
     //    good idea.
     //
     return qualify_names (
-      type_as_string (n, TFF_PLAIN_IDENTIFIER | TFF_UNQUALIFIED_NAME), false);
+      odbc::type_as_string (odbc::type (n), true), false);
   }
 
   string nameable::
@@ -357,7 +324,7 @@ namespace semantics
     if (!TYPE_P (n))
       return "<anonymous>";
 
-    return qualify_names (type_as_string (n, TFF_PLAIN_IDENTIFIER), true);
+    return qualify_names (odbc::type_as_string (odbc::type (n)), true);
   }
 
   string nameable::
@@ -380,7 +347,7 @@ namespace semantics
       tree n (tree_node ());
 
       if (TYPE_P (n))
-        return qualify_names (type_as_string (n, TFF_PLAIN_IDENTIFIER), true);
+        return qualify_names (odbc::type_as_string (odbc::type (n)), true);
 
       // Last resort is to call the other version of fq_name which will
       // check the names edges.

@@ -4,7 +4,7 @@
 #ifndef ODB_LOOKUP_HXX
 #define ODB_LOOKUP_HXX
 
-#include <odb/gcc.hxx>
+#include <odb/clang-fwd.hxx>
 
 #include <string>
 

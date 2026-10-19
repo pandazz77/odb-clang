@@ -37,6 +37,7 @@
 #include <odb/version.hxx>
 #include <odb/options.hxx>
 #include <odb/profile.hxx>
+#include <odb/frontend.hxx>
 
 #ifdef HAVE_CONFIG_H
 #  include <odb/config.h>
@@ -69,10 +70,6 @@ path_search (path const&);
 static path
 driver_path (path const& driver);
 
-#ifndef ODB_STATIC_PLUGIN
-static path
-plugin_path (path const& driver, string const& gxx);
-#endif
 
 //
 // Process manipulation.
@@ -130,9 +127,9 @@ encode_plugin_flag (string const& k);
 static string
 encode_plugin_option (string const& k, string const& v);
 
-// Extract header search paths from GCC's -v output. May throw the
-// profile_failure, process_failure and invalid_path exceptions. Name
-// is the program name (argv[0]) for diagnostics.
+// Obtain the header search paths from the Clang frontend. May throw the
+// profile_failure and invalid_path exceptions. Name is the program name
+// (argv[0]) for diagnostics.
 //
 static paths
 profile_paths (strings const& args, char const* name);
@@ -150,6 +147,11 @@ static char const* const db_macro[] =
 int
 main (int argc, char* argv[])
 {
+  // Compiler frontend mode (see frontend.cxx).
+  //
+  if (argc > 1 && strcmp (argv[1], ODB_FRONTEND_OPTION) == 0)
+    return frontend_main (argc, argv);
+
   ostream& e (cerr);
 
   try
@@ -157,84 +159,30 @@ main (int argc, char* argv[])
     strings args, plugin_args;
     bool v (false);
 
-    // The first argument points to the program name, which is
-    // g++ by default.
+    // The first argument points to the program name, which is the
+    // ODB compiler itself running in the frontend mode.
     //
-#ifdef ODB_GXX_NAME
-    path gxx (ODB_GXX_NAME);
-
-    if (gxx.empty ())
-    {
-      e << argv[0] << ": error: embedded g++ compile name is empty" << endl;
-      return 1;
-    }
-
-    // If the g++ name is a relative path (starts with '.'), then use
-    // our own path as base.
-    //
-    if (gxx.string ()[0] == '.')
     {
       path dp (driver_path (path (argv[0])));
-      path d (dp.directory ());
 
-      if (!d.empty ())
-        gxx = d / gxx;
-    }
-
-    args.push_back (gxx.string ());
-
-    // Also modify LD_LIBRARY_PATH to include the lib path.
-    //
-    // @@ Hm, I wonder why we are doing this? (One some platforms, like
-    //    Fedora, the directory could be called something else, like lib64).
-    //
-#ifndef _WIN32
-    {
-#ifdef __APPLE__
-      char const name[] = "DYLD_LIBRARY_PATH";
-#else
-      char const name[] = "LD_LIBRARY_PATH";
-#endif
-
-      string ld_paths;
-
-      if (char const* s = getenv (name))
-        ld_paths = s;
-
-      path d (gxx.directory ());
-
-      if (!d.empty ())
+      if (dp.empty ())
       {
-        d.complete ();
-        d /= path ("..") / path ("lib");
-
-        if (ld_paths.empty ())
-          ld_paths = d.string ();
-        else
-          ld_paths = d.string () + path::traits::path_separator + ld_paths;
-
-        if (setenv (name, ld_paths.c_str (), 1) != 0)
-        {
-          e << argv[0] << ": error: unable to update environment" << endl;
-          return 1;
-        }
+        e << argv[0] << ": error: unable to resolve ODB compiler driver path"
+          << endl;
+        return 1;
       }
-    }
-#endif // _WIN32
 
-#else
-    args.push_back ("g++");
-#endif // ODB_GXX_NAME
+      args.push_back (dp.string ());
+      args.push_back (ODB_FRONTEND_OPTION);
+    }
 
     // Default options.
     //
     args.push_back ("-x");
     args.push_back ("c++");
     args.push_back (""); // Reserve space for -std=c++XX.
-    args.push_back ("-S");
     args.push_back ("-Wunknown-pragmas");
     args.push_back ("-Wno-deprecated");
-    args.push_back (""); // Reserve space for -fplugin=path.
 
     // Parse the default options file if we have one.
     //
@@ -299,10 +247,12 @@ main (int argc, char* argv[])
             first_x = false;
 
             // If it doesn't start with '-', then it must be the g++
-            // executable name. Update the first argument with it.
+            // executable name, which is no longer used.
             //
             if (a[0] != '-')
-              args[0] = a;
+              e << file << ": warning: ignoring compiler executable '"
+                << a << "' (C++ is parsed with the built-in Clang frontend)"
+                << endl;
             else
               args.push_back (a);
           }
@@ -429,10 +379,12 @@ main (int argc, char* argv[])
           first_x = false;
 
           // If it doesn't start with '-', then it must be the g++
-          // executable name. Update the first argument with it.
+          // executable name, which is no longer used.
           //
           if (v[0] != '-')
-            args[0] = v;
+            e << argv[0] << ": warning: ignoring compiler executable '"
+              << v << "' (C++ is parsed with the built-in Clang frontend)"
+              << endl;
           else
             args.push_back (v);
         }
@@ -527,59 +479,6 @@ main (int argc, char* argv[])
     // ones.
     //
     args.insert (args.end (), def_inc_dirs.begin (), def_inc_dirs.end ());
-
-    // Find the plugin.
-    //
-    {
-#ifndef ODB_STATIC_PLUGIN
-      path plugin (plugin_path (path (argv[0]), args[0]));
-#else
-      // Use a dummy name if the plugin is linked into the compiler.
-      //
-      path plugin ("odb");
-#endif
-
-      if (plugin.empty ())
-        return 1; // Diagnostics has already been issued.
-
-#ifdef _WIN32
-      // Here is the problem: since the plugin is loaded by GCC (cc1plus.exe
-      // to be precise), the DLL assembly magic we have for executables won't
-      // help here.
-      //
-      // To allow executing the ODB compiler in-place we add the odb.exe.dlls/
-      // directory to PATH. It is a bit of hack but then DLL assemblies for
-      // DLLs is a whole new level of insanity that we are unlikely to ever
-      // touch.
-      //
-      // And it turns out we have the same problem in the installed case: if
-      // the installation directory is not in PATH, then GCC won't find the
-      // DLLs the plugin needs. So we handle both cases here.
-      //
-      {
-        path d (plugin.directory ());
-        d.complete ();
-        d.normalize ();
-        d /= path ("odb.exe.dlls");
-
-        struct stat st;
-        if (stat (d.string ().c_str (), &st) != 0 || !S_ISDIR (st.st_mode))
-          d = d.directory ();
-
-        string v ("PATH=" + d.string ());
-
-        if (char const* p = getenv ("PATH"))
-        {
-          v += ';';
-          v += p;
-        }
-
-        _putenv (v.c_str ());
-      }
-#endif
-
-      args[7] = "-fplugin=" + plugin.string ();
-    }
 
     // Parse plugin options. We have to do it twice to get the target
     // database which is needed while loading profiles.
@@ -692,32 +591,32 @@ main (int argc, char* argv[])
         }
       case cxx_version::cxx11:
         {
-          args[3] = "-std=c++0x";
+          args[4] = "-std=c++0x";
           break;
         }
       case cxx_version::cxx14:
         {
-          args[3] = "-std=c++1y";
+          args[4] = "-std=c++1y";
           break;
         }
       case cxx_version::cxx17:
         {
-          args[3] = "-std=c++1z";
+          args[4] = "-std=c++1z";
           break;
         }
       case cxx_version::cxx20:
         {
-          args[3] = "-std=c++2a";
+          args[4] = "-std=c++2a";
           break;
         }
       case cxx_version::cxx23:
         {
-          args[3] = "-std=c++2b";
+          args[4] = "-std=c++2b";
           break;
         }
       case cxx_version::cxx26:
         {
-          args[3] = "-std=c++2c";
+          args[4] = "-std=c++2c";
           break;
         }
       }
@@ -880,16 +779,6 @@ main (int argc, char* argv[])
         exec_args.push_back (i->c_str ());
       }
 
-      // Disable assembly output.
-      //
-      exec_args.push_back ("-o");
-
-#ifndef _WIN32
-      exec_args.push_back ("/dev/null");
-#else
-      exec_args.push_back ("nul");
-#endif
-
       exec_args.push_back ("-"); // Compile stdin.
       exec_args.push_back (0);
 
@@ -939,7 +828,7 @@ main (int argc, char* argv[])
         cstrings eas (exec_args);
         string ops_file_arg;
         auto_remove opt_file_rm (
-          fixup_cmd_line (eas, 1, argv[0], ops_file_arg));
+          fixup_cmd_line (eas, 2, argv[0], ops_file_arg));
 #else
         cstrings& eas (exec_args);
 #endif
@@ -1330,19 +1219,12 @@ encode_plugin_option (string const& k, string const& cv)
 static paths
 profile_paths (strings const& sargs, char const* name)
 {
-  // Copy some of the arguments from the passed list. We also need
-  // the g++ executable.
+  // Copy the relevant arguments from the passed list skipping the
+  // executable and the frontend mode option.
   //
   strings args;
 
-  args.push_back (sargs[0]);
-  args.push_back ("-v");
-  args.push_back ("-x");
-  args.push_back ("c++");
-  args.push_back ("-E");
-  args.push_back ("-P");
-
-  for (strings::const_iterator i (++sargs.begin ()), end (sargs.end ());
+  for (strings::const_iterator i (sargs.begin () + 2), end (sargs.end ());
        i != end; ++i)
   {
     string const& a (*i);
@@ -1364,7 +1246,8 @@ profile_paths (strings const& sargs, char const* name)
              a == "-iquote"    ||
              a == "-idirafter" ||
              a == "-isysroot"  ||
-             a == "-framework")
+             a == "-framework" ||
+             a == "-target")
     {
       args.push_back (a);
 
@@ -1377,9 +1260,13 @@ profile_paths (strings const& sargs, char const* name)
 
       args.push_back (*i);
     }
-    // --sysroot
+    // --sysroot, --target, etc.
     //
-    else if (a.compare (0, 10, "--sysroot=") == 0)
+    else if (a.compare (0, 10, "--sysroot=") == 0 ||
+             a.compare (0, 9, "--target=") == 0 ||
+             a.compare (0, 16, "--gcc-toolchain=") == 0 ||
+             a.compare (0, 8, "-stdlib=") == 0 ||
+             a == "-nostdinc" || a == "-nostdinc++")
       args.push_back (a);
     // -std
     //
@@ -1387,140 +1274,12 @@ profile_paths (strings const& sargs, char const* name)
       args.push_back (a);
   }
 
-  // Create an execvp-compatible argument array.
-  //
-  vector<char const*> exec_args;
-
-  for (strings::const_iterator i (args.begin ()), end (args.end ());
-       i != end; ++i)
-  {
-    exec_args.push_back (i->c_str ());
-  }
-
-  exec_args.push_back ("-"); // Compile stdin.
-  exec_args.push_back (0);
-
-#ifdef _WIN32
-  string ops_file_arg;
-  auto_remove opt_file_rm (fixup_cmd_line (exec_args, 1, name, ops_file_arg));
-#endif
-
-  process_info pi (start_process (&exec_args[0], name, true));
-  close (pi.out_fd); // Preprocess empty file.
-
-  // Read the output into a temporary string stream. We don't parse
-  // it on the fly because we don't know whether it is the data or
-  // diagnostics until after the process is terminated and we get
-  // the exit code. We also cannot first wait for the exist code
-  // and then read the output because the process might get blocked.
-  //
-  stringstream ss;
-  {
-    __gnu_cxx::stdio_filebuf<char> fb (pi.in_efd, ios_base::in);
-    istream is (&fb);
-
-    for (bool first (true); !is.eof (); )
-    {
-      string line;
-      getline (is, line);
-
-      if (is.fail () && !is.eof ())
-      {
-        cerr << name << ": error: "
-             << "io failure while parsing profile paths" << endl;
-
-        wait_process (pi, name);
-        throw profile_failure ();
-      }
-
-      if (first)
-        first = false;
-      else
-        ss << endl;
-
-      ss << line;
-    }
-  }
-
-  if (!wait_process (pi, name))
-  {
-    // Things didn't go well and ss should contain the diagnostics.
-    // In case it is empty, issue our own.
-    //
-    if (!ss.str ().empty ())
-      cerr << ss.rdbuf ();
-    else
-      cerr << name << ": error: unable to extract profile paths" << endl;
-
-    throw profile_failure ();
-  }
-
-  // Parse the cached output.
-  //
   paths r;
+
+  if (!frontend_include_paths (args, name, r))
   {
-    enum
-    {
-      read_prefix,
-      read_path,
-      read_suffix
-    } state = read_prefix;
-
-    while (!ss.eof () && state != read_suffix)
-    {
-      string line;
-      getline (ss, line);
-
-      if (ss.fail () && !ss.eof ())
-      {
-        cerr << name << ": error: "
-             << "io failure while parsing profile paths" << endl;
-        throw profile_failure ();
-      }
-
-      switch (state)
-      {
-      case read_prefix:
-        {
-          // The English string that we are looking for is "#include <...>
-          // search starts here:" but it can be translated. However, all
-          // the translations seems to have the "#include" and "<...>"
-          // parts, so we can search for those.
-          //
-          if (line.find ("#include") != string::npos &&
-              line.find ("<...>") != string::npos)
-            state = read_path;
-          break;
-        }
-      case read_path:
-        {
-          // The end of the list is terminated with the "End of search
-          // list." line, which, again, can be translated. Here we don't
-          // have any invariable parts that we can use. Instead, we will
-          // rely on the fact that all the paths are space-indented.
-          //
-          if (!line.empty () && line[0] != ' ')
-            state = read_suffix;
-          else
-            // Paths are indented with a space.
-            //
-            r.push_back (path (string (line, 1)));
-
-          break;
-        }
-      case read_suffix:
-        {
-          // We shouldn't get here.
-          break;
-        }
-      }
-    }
-
-    if (state != read_suffix)
-    {
-      cerr << name << ": error: unable to parse profile paths" << endl;
-      throw profile_failure ();
-    }
+    cerr << name << ": error: unable to extract profile paths" << endl;
+    throw profile_failure ();
   }
 
   return r;
@@ -1619,90 +1378,6 @@ driver_path (path const& drv)
 {
   return drv.directory ().empty () ? path_search (drv) : drv;
 }
-
-#ifndef ODB_STATIC_PLUGIN
-static path
-plugin_path (path const& drv,
-#ifdef ODB_GCC_PLUGIN_DIR
-             string const& gxx)
-#else
-             string const&)
-#endif
-{
-#ifdef _WIN32
-  char const plugin_ext[] = ".dll";
-
-// While GCC 8 switched to using .dylib as the plugin extension, there is a
-// bug (86358) in the extension stripping code. So for now we use the .so
-// extension everywhere (see also buildfile if changing this).
-//
-//#elif defined(__APPLE__)
-//  char const plugin_ext[] = ".dylib";
-#else
-  char const plugin_ext[] = ".so";
-#endif
-
-  // Figure out the plugin base name which is just the driver name (but
-  // without the .exe extension on Windows).
-  //
-#ifdef _WIN32
-  string b (drv.leaf ().base ().string ());
-#else
-  string b (drv.leaf ().string ());
-#endif
-
-  path dp (driver_path (drv));
-
-  if (dp.empty ())
-  {
-    cerr << drv << ": error: unable to resolve ODB compiler driver path" << endl;
-    return path ();
-  }
-
-  dp = dp.directory ();
-  struct stat info;
-
-  path pp;
-
-#ifdef ODB_GCC_PLUGIN_DIR
-  // Plugin could be installed into the GCC default plugin directory, in which
-  // case we can simply pass the plugin name and let GCC append the correct
-  // directory.
-  //
-  return path (b);
-
-#elif defined (ODB_PLUGIN_PATH)
-  // If we were given a plugin path, use that.
-  //
-  {
-    string rp (ODB_PLUGIN_PATH);
-    if (!rp.empty ())
-      dp /= path (rp);
-
-    pp = dp / path (b + plugin_ext);
-
-    if (stat (pp.string ().c_str (), &info) != 0)
-    {
-      cerr << drv << ": error: no ODB plugin in '" << dp << "'" << endl;
-      return path ();
-    }
-
-    return pp;
-  }
-#endif
-
-  // Try in the current directory.
-  //
-  pp = dp / path (b + plugin_ext);
-  if (stat (pp.string ().c_str (), &info) != 0)
-  {
-    cerr << drv << ": error: unable to locate ODB plugin" << endl;
-    return path ();
-  }
-
-  return pp;
-}
-#endif
 
 //
 // Process manipulation.
