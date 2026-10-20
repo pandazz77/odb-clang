@@ -1,0 +1,243 @@
+# Build the Clang-based ODB compiler on Linux and Windows, run the tests,
+# and, for v* tags, publish a GitHub release with the binaries.
+#
+name: CI
+
+on:
+  push:
+    branches: [clang]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  LLVM_VERSION: 22
+
+jobs:
+  linux:
+    name: Linux (build and test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install LLVM/Clang ${{ env.LLVM_VERSION }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build zlib1g-dev libzstd-dev libsqlite3-dev
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          sudo bash /tmp/llvm.sh $LLVM_VERSION
+          sudo apt-get install -y --no-install-recommends \
+            llvm-$LLVM_VERSION-dev libclang-$LLVM_VERSION-dev \
+            libclang-common-$LLVM_VERSION-dev
+          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          cmake -G Ninja -S odb -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          file build/odb
+          build/odb --version
+
+      - name: Test (SQLite, generate and run)
+        env:
+          ODB: ${{ github.workspace }}/build/odb
+          WORK: ${{ runner.temp }}/test
+        run: |
+          python3 odb/etc/test/run_tests.py sqlite
+          python3 odb/etc/test/run_drivers.py
+
+      - name: Test (other databases, generate and compile)
+        env:
+          ODB: ${{ github.workspace }}/build/odb
+          WORK: ${{ runner.temp }}/test
+        run: |
+          for db in pgsql oracle mssql; do
+            OUTDIR=out-$db python3 odb/etc/test/run_tests.py $db
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: odb-linux-x86_64
+          path: build/odb
+          if-no-files-found: error
+
+  # Make sure the static binary works on other distributions without GCC
+  # (only the libstdc++ headers installed).
+  #
+  linux-distros:
+    name: Linux (${{ matrix.image }}, no GCC)
+    needs: linux
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: debian:12
+            setup: apt-get update && apt-get install -y --no-install-recommends libstdc++-12-dev
+          - image: fedora:41
+            setup: dnf install -y libstdc++-devel glibc-devel
+          - image: alpine:3.20
+            setup: apk add libstdc++-dev musl-dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: odb-linux-x86_64
+          path: bin
+
+      # Run in a plain container (JavaScript actions don't work in some of
+      # these images, e.g., Alpine).
+      #
+      - name: Run odb
+        run: |
+          chmod +x bin/odb
+          docker run --rm -v "$PWD:/w" -w /w ${{ matrix.image }} sh -ec '
+            ${{ matrix.setup }} >/dev/null
+            for c in gcc g++ cc c++; do
+              if command -v $c; then echo "unexpected $c"; exit 1; fi
+            done
+            mkdir -p /tmp/out
+            bin/odb -d sqlite --generate-query --generate-schema -o /tmp/out \
+              -I odb/etc/test/inc -I libodb odb/etc/test/smoke/person.hxx
+            ls -l /tmp/out
+            test -s /tmp/out/person-odb.cxx'
+
+  windows:
+    name: Windows (build and test)
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-python
+            mingw-w64-ucrt-x86_64-clang
+            mingw-w64-ucrt-x86_64-llvm
+            mingw-w64-ucrt-x86_64-llvm-tools
+            mingw-w64-ucrt-x86_64-zlib
+            mingw-w64-ucrt-x86_64-zstd
+            mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-sqlite3
+
+      - name: Build
+        run: |
+          cmake -G Ninja -S odb -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          build/odb.exe --version
+          echo "Imported DLLs:"
+          objdump -p build/odb.exe | grep "DLL Name"
+
+      - name: Test (SQLite, generate and run)
+        env:
+          ODB: ${{ github.workspace }}\build\odb.exe
+          WORK: ${{ runner.temp }}\test
+        run: |
+          python odb/etc/test/run_tests.py sqlite
+          python odb/etc/test/run_drivers.py
+
+      - name: Test (other databases, generate and compile)
+        env:
+          ODB: ${{ github.workspace }}\build\odb.exe
+          WORK: ${{ runner.temp }}\test
+        run: |
+          for db in pgsql oracle mssql; do
+            OUTDIR=out-$db python odb/etc/test/run_tests.py $db
+          done
+
+      # Run without MSYS2/GCC in PATH: odb should fall back to the MSVC
+      # toolset installed on the runner.
+      #
+      - name: Test (no GCC, MSVC fallback)
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Windows\system32"
+          New-Item -ItemType Directory out-nogcc | Out-Null
+          & build\odb.exe -d sqlite --generate-query --generate-schema `
+            -o out-nogcc -I odb\etc\test\inc -I libodb `
+            odb\etc\test\smoke\person.hxx
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Get-ChildItem out-nogcc
+          if (-not (Test-Path out-nogcc\person-odb.cxx)) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: odb-windows-x86_64
+          path: build/odb.exe
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, linux-distros, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+
+          d="odb-$tag-linux-x86_64"
+          mkdir -p "$d/bin"
+          install -m 755 artifacts/odb-linux-x86_64/odb "$d/bin/odb"
+          cp odb/README.md odb/LICENSE odb/GPLv3 "$d/"
+          tar czf "dist/$d.tar.gz" "$d"
+
+          d="odb-$tag-windows-x86_64"
+          mkdir -p "$d/bin"
+          cp artifacts/odb-windows-x86_64/odb.exe "$d/bin/odb.exe"
+          cp odb/README.md odb/LICENSE odb/GPLv3 "$d/"
+          zip -qr "dist/$d.zip" "$d"
+
+          cd dist
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<EOF
+          ODB compiler built with a static Clang/LLVM frontend (no GCC
+          required). Single self-contained executables:
+
+          - \`odb-${GITHUB_REF_NAME}-linux-x86_64.tar.gz\`: fully static,
+            runs on any x86-64 Linux distribution (glibc or musl). Requires
+            the C++ standard library headers (for example, libstdc++).
+          - \`odb-${GITHUB_REF_NAME}-windows-x86_64.zip\`: uses the MinGW-w64
+            headers if found, otherwise the installed Visual Studio (MSVC)
+            toolset.
+
+          See [odb/README.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/odb/README.md)
+          for usage notes.
+          EOF
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "ODB $GITHUB_REF_NAME (Clang-based compiler)" \
+            --notes-file notes.md \
+            $([[ "$GITHUB_REF_NAME" == *-* ]] && echo --prerelease)

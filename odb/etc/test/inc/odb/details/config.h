@@ -1,0 +1,1 @@
+#define ODB_THREADS_CXX11 1
