@@ -37,7 +37,7 @@ odb -d pgsql  -x --sysroot=/opt/sysroot ...
 The first `-x` value that doesn't start with `-` (a g++ executable name)
 is ignored with a warning.
 
-Building (requires static Clang/LLVM libraries, CMake, and Ninja; run from
+Building (requires static Clang/LLVM 22 libraries, CMake, and Ninja; run from
 the repository root):
 
 ```

@@ -59,6 +59,18 @@ separate_arguments (LLVM_LIBS UNIX_COMMAND "${LLVM_LIBS}")
 
 string (REGEX MATCH "^[0-9]+" LLVM_VERSION_MAJOR "${LLVM_VERSION}")
 
+# The Clang API changes between major versions.
+#
+set (ODB_LLVM_SUPPORTED_VERSION 22)
+option (ODB_IGNORE_LLVM_VERSION "Build with unsupported LLVM version" OFF)
+
+if (NOT LLVM_VERSION_MAJOR EQUAL ODB_LLVM_SUPPORTED_VERSION AND
+    NOT ODB_IGNORE_LLVM_VERSION)
+  message (FATAL_ERROR "LLVM/Clang ${ODB_LLVM_SUPPORTED_VERSION}.x is "
+           "required, found ${LLVM_VERSION} (${LLVM_CONFIG}); pass "
+           "-DLLVM_CONFIG=<path> or -DODB_IGNORE_LLVM_VERSION=ON")
+endif ()
+
 # Clang resource directory (builtin headers) that we embed into the
 # executable.
 #

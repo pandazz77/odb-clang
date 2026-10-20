@@ -16,6 +16,7 @@ concurrency:
 
 env:
   LLVM_VERSION: 22
+  MSYS2_LLVM: 22.1.7-1
 
 jobs:
   linux:
@@ -130,13 +131,25 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-python
-            mingw-w64-ucrt-x86_64-clang
-            mingw-w64-ucrt-x86_64-llvm
-            mingw-w64-ucrt-x86_64-llvm-tools
             mingw-w64-ucrt-x86_64-zlib
             mingw-w64-ucrt-x86_64-zstd
             mingw-w64-ucrt-x86_64-libxml2
+            mingw-w64-ucrt-x86_64-libffi
             mingw-w64-ucrt-x86_64-sqlite3
+
+      # MSYS2 only keeps the latest LLVM version in the repository so
+      # install the exact version we support from the package archive.
+      #
+      - name: Install LLVM/Clang ${{ env.MSYS2_LLVM }}
+        run: |
+          u=https://repo.msys2.org/mingw/ucrt64/mingw-w64-ucrt-x86_64
+          pacman -U --noconfirm \
+            $u-llvm-libs-$MSYS2_LLVM-any.pkg.tar.zst \
+            $u-llvm-tools-$MSYS2_LLVM-any.pkg.tar.zst \
+            $u-llvm-$MSYS2_LLVM-any.pkg.tar.zst \
+            $u-clang-libs-$MSYS2_LLVM-any.pkg.tar.zst \
+            $u-clang-$MSYS2_LLVM-any.pkg.tar.zst
+          llvm-config --version
 
       - name: Build
         run: |
