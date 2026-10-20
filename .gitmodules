@@ -1,0 +1,9 @@
+[submodule "deps/libcutl"]
+	path = deps/libcutl
+	url = https://github.com/codesynthesis-com/libcutl.git
+[submodule "deps/libstudxml"]
+	path = deps/libstudxml
+	url = https://github.com/codesynthesis-com/libstudxml.git
+[submodule "deps/libstud-optional"]
+	path = deps/libstud-optional
+	url = https://github.com/libstud/libstud-optional.git

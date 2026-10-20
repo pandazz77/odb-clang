@@ -37,12 +37,16 @@ odb -d pgsql  -x --sysroot=/opt/sysroot ...
 The first `-x` value that doesn't start with `-` (a g++ executable name)
 is ignored with a warning.
 
-Building (requires static Clang/LLVM libraries, CMake, and Ninja):
+Building (requires static Clang/LLVM libraries, CMake, and Ninja; run from
+the repository root):
 
 ```
-cmake -G Ninja -S odb/odb -B build -DCMAKE_BUILD_TYPE=Release
+git submodule update --init
+cmake -G Ninja -S odb -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
+
+If `llvm-config` is not in `PATH`, pass `-DLLVM_CONFIG=<path>`.
 
 On Linux the result is a fully static executable that runs on any x86-64
 distribution (tested on Ubuntu 24.04, Debian 12, Fedora 41, and Alpine

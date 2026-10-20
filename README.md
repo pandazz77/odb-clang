@@ -1,4 +1,21 @@
-# ODB - ORM for C++
+# ODB - ORM for C++ (Clang-based compiler)
+
+**This is a fork of [ODB](https://github.com/codesynthesis-com/odb) in which
+the ODB compiler parses C++ with a built-in Clang frontend instead of
+running as a GCC plugin.** The compiler is a single self-contained
+executable (Clang/LLVM linked statically, builtin headers embedded) that
+does not require GCC. See [`odb/README.md`](odb/README.md) for details,
+build instructions, and usage notes. Quick build:
+
+```
+git clone --recursive https://github.com/pandazz77/odb-clang.git
+cd odb-clang
+cmake -G Ninja -S odb -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The rest of this file is the original ODB README.
+
 
 ODB is an open-source, cross-platform, and cross-database object-relational
 mapping (ORM) system for C++. It allows you to persist C++ classes to a

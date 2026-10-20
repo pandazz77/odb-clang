@@ -24,7 +24,15 @@ set (CMAKE_CXX_STANDARD 17)
 set (CMAKE_CXX_STANDARD_REQUIRED ON)
 set (CMAKE_CXX_EXTENSIONS OFF)
 
-set (ODB_DEPS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../deps" CACHE PATH
+# By default use the git submodules in deps/ (git submodule update --init).
+#
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../deps/libcutl/libcutl")
+  set (ODB_DEPS_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../deps")
+else ()
+  set (ODB_DEPS_DEFAULT "${CMAKE_CURRENT_SOURCE_DIR}/../../deps")
+endif ()
+
+set (ODB_DEPS_DIR "${ODB_DEPS_DEFAULT}" CACHE PATH
      "Directory containing libcutl, libstudxml, and libstud-optional")
 
 option (ODB_STATIC "Link the odb executable statically" ON)

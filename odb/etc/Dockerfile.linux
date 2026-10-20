@@ -1,11 +1,10 @@
 # Build environment for the Clang-based ODB compiler on Linux (static
-# LLVM/Clang 22 from apt.llvm.org). Usage (from the directory containing
-# the odb repository and the deps/ directory with libcutl, libstudxml, and
-# libstud-optional):
+# LLVM/Clang 22 from apt.llvm.org). Usage (from the repository root, with
+# submodules checked out):
 #
-# docker build -f odb/odb/etc/Dockerfile.linux -t odb-clang-build .
+# docker build -f odb/etc/Dockerfile.linux -t odb-clang-build .
 # docker run --rm -v "$PWD:/src" odb-clang-build sh -c \
-#   "cmake -G Ninja -S /src/odb/odb -B /src/build-linux \
+#   "cmake -G Ninja -S /src/odb -B /src/build-linux \
 #      -DCMAKE_BUILD_TYPE=Release && cmake --build /src/build-linux"
 #
 FROM ubuntu:24.04
