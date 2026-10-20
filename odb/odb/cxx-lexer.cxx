@@ -62,7 +62,7 @@ namespace odbc
     case comma:                return CPP_COMMA;
     case l_paren:              return CPP_OPEN_PAREN;
     case r_paren:              return CPP_CLOSE_PAREN;
-    case eof:
+    case clang::tok::eof:
     case eod:                  return CPP_EOF;
     case equalequal:           return CPP_EQ_EQ;
     case exclaimequal:         return CPP_NOT_EQ;
